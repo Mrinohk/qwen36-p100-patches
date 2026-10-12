@@ -1,0 +1,242 @@
+From 97b68640bfa54474a4d62c44817dc8620947904d Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 12:35:11 -0400
+Subject: [PATCH 07/31] Fuse the GDN gated output norm: rms_norm * w * silu(z)
+ in one kernel
+
+The gated delta net's output is rms_norm(x) * ssm_norm * silu(z), which ran as
+stock's fused norm*weight plus the fused silu*mul, two launches per layer.
+rms_norm_f32 gets a do_gate variant that takes z in the add operand's slot,
+loads x, w and z before the row reduction (rows are 128 wide, one value per
+thread) and stores silu(z) * (norm * w), the same products in the same order,
+so the result is bit-exact.
+
+The z projection was scheduled between the norm and the gate because nothing
+needed it earlier; qwen35moe's build_norm_gated now expands it first so the
+four nodes are adjacent. That only changes the node order. The matcher uses
+ggml_can_fuse_subgraph since the silu takes z, not the previous node. Only on
+with GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_FUSE_NORM_GATE=0 turns it off.
+
+2x P100: decode wall 15.61 -> 15.49 ms/token in the trace, MTP 8-prompt
+110.4 -> 110.85 t/s (+0.4%, two rounds). Wikitext KLD at ub=1 vs the previous
+commit: 0, same top 100%; MTP outputs byte-identical to the previous commit.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 23 +++++++++++++
+ ggml/src/ggml-cuda/norm.cu      | 58 ++++++++++++++++++++++++++++-----
+ ggml/src/ggml-cuda/norm.cuh     |  3 +-
+ src/models/qwen35moe.cpp        |  3 ++
+ 4 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 41b07f67f..85fba3085 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4396,6 +4396,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // RMS norm -> MUL weight -> MUL by SILU(z) (the gated delta net's output norm): one kernel, same arithmetic as the
++    // stock RMS_NORM+MUL and UNARY+MUL fusions it replaces
++    if (const int ng_out[] = { i + 3 }; i + 3 < cgraph->n_nodes &&
++            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 }) &&
++            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, ng_out, 1)) {
++        static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++            (getenv("GGML_CUDA_P60_FUSE_NORM_GATE") == nullptr || atoi(getenv("GGML_CUDA_P60_FUSE_NORM_GATE")) != 0);
++        ggml_tensor * mul  = cgraph->nodes[i + 1];
++        ggml_tensor * silu = cgraph->nodes[i + 2];
++        ggml_tensor * gmul = cgraph->nodes[i + 3];
++        const ggml_tensor * w = mul->src[0] == node ? mul->src[1] : mul->src[0];
++        const ggml_tensor * z = silu->src[0];
++        if (enabled && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
++                (mul->src[0] == node || mul->src[1] == node) && ggml_are_same_shape(mul, node) &&
++                ((gmul->src[0] == mul && gmul->src[1] == silu) || (gmul->src[0] == silu && gmul->src[1] == mul)) &&
++                node->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 && gmul->type == GGML_TYPE_F32 &&
++                node->ne[0] <= 256 && ggml_are_same_shape(z, gmul) && ggml_are_same_shape(gmul, mul) && ggml_is_contiguous(gmul) &&
++                z->nb[0] == sizeof(float) && w->nb[0] == sizeof(float) && node->src[0]->nb[0] == sizeof(float)) {
++            ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, mul, gmul, silu);
++            return 3;
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index edd81a7f0..24da745e4 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,5 +1,6 @@
+ #include "norm.cuh"
+ #include "mmvq-p60.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -74,7 +75,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
+-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
++template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_gate = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+@@ -111,6 +112,8 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+     static_assert(!do_scale || !do_multiply, "fusing scale is only supported for a plain norm");
++    // do_gate: dst = silu(g) * (norm * mul), with g passed in the add operand's slot (the gated delta net's output norm)
++    static_assert(!do_gate || (do_multiply && !do_add), "fusing a gate needs multiply and replaces add");
+ 
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+@@ -122,7 +125,7 @@ static __global__ void rms_norm_f32(const float * x,
+         mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+     }
+ 
+-    if constexpr (do_add) {
++    if constexpr (do_add || do_gate) {
+         const int add_row     = fastmodulo(row, add_nrows_packed);
+         const int add_channel = fastmodulo(channel, add_nchannels_packed);
+         const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+@@ -145,6 +148,27 @@ static __global__ void rms_norm_f32(const float * x,
+     float xv[max_cache];
+ 
+     ggml_cuda_pdl_sync();
++    if constexpr (do_gate) {
++        // one value per thread (the launcher checks ncols <= block_size): issue the x, weight and gate loads together
++        // before the reduction instead of leaving two of them to its tail. The sum and products are those of the
++        // general path below.
++        float xi = 0.0f, mv = 0.0f, gv = 0.0f;
++        if (tid < ncols) {
++            xi = x[tid];
++            mv = mul[fastmodulo(tid, mul_ncols_packed)];
++            gv = add[fastmodulo(tid, add_ncols_packed)];
++        }
++        tmp += xi * xi;
++        extern __shared__ float s_sum[];
++        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++        const float mean  = tmp / ncols;
++        const float scale = rsqrtf(mean + eps);
++        if (tid < ncols) {
++            const float y = scale * xi * mv;
++            dst[tid]      = ggml_cuda_op_silu_single(gv) * y;
++        }
++        return;
++    }
+     if (cached) {
+ #pragma unroll
+         for (int k = 0; k < max_cache; ++k) {
+@@ -168,7 +192,13 @@ static __global__ void rms_norm_f32(const float * x,
+     const float scale = rsqrtf(mean + eps);
+ 
+     auto store = [&](const int col, const float xi) {
+-        if constexpr (do_multiply && do_add) {
++        if constexpr (do_gate) {
++            // a fused UNARY(SILU) + MUL: same expression as unary_gated_op_kernel on the stored norm * weight
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            const int add_col = fastmodulo(col, add_ncols_packed);
++            const float y     = scale * xi * mul[mul_col];
++            dst[col]          = ggml_cuda_op_silu_single(add[add_col]) * y;
++        } else if constexpr (do_multiply && do_add) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+             dst[col]          = scale * xi * mul[mul_col] + add[add_col];
+@@ -583,8 +613,10 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
+-                                  cudaStream_t   stream) {
++                                  cudaStream_t   stream,
++                                  const bool     gate = false) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
++    GGML_ASSERT(!gate || (add != nullptr && ncols <= 256));
+     if (mul == nullptr) {
+         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+         return;
+@@ -624,7 +656,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         if (ncols < 1024) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
++            ggml_cuda_kernel_launch(gate ? rms_norm_f32<256, true, false, false, true> : rms_norm_f32<256, true, true>, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+@@ -632,7 +664,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
++            ggml_cuda_kernel_launch(gate ? rms_norm_f32<1024, true, false, false, true> : rms_norm_f32<1024, true, true>, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+@@ -819,7 +851,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-                                     ggml_tensor *               add_tensor) {
++                                     ggml_tensor *               add_tensor,
++                                     ggml_tensor *               gate_unary) {
+     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+     float               eps          = 0.0f;
+ 
+@@ -842,7 +875,14 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+     const float *       add_d   = nullptr;
+     const ggml_tensor * add_src = nullptr;
+ 
+-    if (add_tensor->src[0] == mul_tensor) {
++    if (gate_unary != nullptr) {
++        // add_tensor is MUL(mul_tensor, gate_unary): the gate's input takes the add operand's place
++        GGML_ASSERT((add_tensor->src[0] == mul_tensor && add_tensor->src[1] == gate_unary) ||
++                    (add_tensor->src[1] == mul_tensor && add_tensor->src[0] == gate_unary));
++        add_src = gate_unary->src[0];
++        add_d   = (const float *) add_src->data;
++        GGML_ASSERT(ggml_are_same_shape(add_src, add_tensor));
++    } else if (add_tensor->src[0] == mul_tensor) {
+         add_d   = (float *) add_tensor->src[1]->data;
+         add_src = add_tensor->src[1];
+     } else if (add_tensor->src[1] == mul_tensor) {
+@@ -901,7 +941,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                           /*add_s00*/ add_s01, add_s02, add_s03,
+                           add_ncols, add_nrows, add_nchannels, add_nsamples,
+-                          eps, stream);
++                          eps, stream, gate_unary != nullptr);
+ }
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index f1f0ad743..733a445af 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -13,7 +13,8 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-                                     ggml_tensor *               add_tensor);
++                                     ggml_tensor *               add_tensor,
++                                     ggml_tensor *               gate_unary = nullptr);
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index bdf772625..ba642c046 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -269,6 +269,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
+         ggml_tensor * weights,
+         ggml_tensor * gate,
+         int           layer) {
++    // schedule the gate's projection first so the norm, its weight, the silu and the gating multiply are adjacent
++    // nodes that the backend can fuse; the computation is unchanged
++    ggml_build_forward_expand(gf, gate);
+     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+ 
+-- 
+2.56.0
+

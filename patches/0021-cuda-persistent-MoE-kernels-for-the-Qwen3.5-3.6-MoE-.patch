@@ -1,0 +1,82 @@
+From 479f8068b3378d45298978f6282c35ab2a84c77b Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 11:43:13 -0400
+Subject: [PATCH 21/31] cuda : persistent MoE kernels for the Qwen3.5/3.6 MoE
+ MTP draft head on sm_60
+
+The MTP head's MoE half (layer 40) ends at mtp_post_ffn instead of l_out, and its router and shared-expert gate are
+BF16. Match the other end node, and give the kernels an f32 copy of BF16 router / gate weights, converted once per
+device (exact). The draft head now runs its MoE half as one persistent kernel at T = 1 (each draft step) and in the
+multi-token kernel for the catch-up batch.
+
+Only draft tokens change (the main model verifies every token), so output quality is unaffected.
+2x P100, Qwen3.6-35B-A3B UD-Q4_K_XL, MTP n5 + draft vocab, prod sampler, 8 prompts x 256: 160.8 -> 166.0 t/s.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 69b43549e..366fef2ef 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4009,6 +4009,28 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     return e - i;
+ }
+ 
++// f32 copy of a small bf16 weight (the MTP head's router and shared-expert gate), made once per device; bf16 -> f32 is exact
++static const float * p60_f32_weight(ggml_backend_cuda_context * ctx, const ggml_tensor * t) {
++    if (t->type == GGML_TYPE_F32) {
++        return (const float *) t->data;
++    }
++    static std::mutex mtx;
++    static std::map<std::pair<int, const void *>, float *> cache;
++    std::lock_guard<std::mutex> lock(mtx);
++    float *& p = cache[{ ctx->device, t->data }];
++    if (p == nullptr) {
++        CUDA_CHECK(cudaMalloc(&p, ggml_nelements(t) * sizeof(float)));
++        ggml_get_to_fp32_cuda(t->type)(t->data, p, ggml_nelements(t), ctx->stream());
++        CUDA_CHECK(cudaGetLastError());
++    }
++    return p;
++}
++
++// f32, or bf16 (converted once, see p60_f32_weight)
++static bool p60_mat_f32ish(const ggml_tensor * t, int64_t ne0, int64_t ne1) {
++    return t != nullptr && (p60_mat(t, GGML_TYPE_F32, ne0, ne1) || p60_mat(t, GGML_TYPE_BF16, ne0, ne1));
++}
++
+ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, int i, bool dry = false) {
+     const ggml_tensor * norm = g->nodes[i];
+     const ggml_tensor * cur_t = nullptr;
+@@ -4026,7 +4048,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     int e = -1;
+     for (int k = i + 2; k < g->n_nodes && k < i + 100; k++) {
+         const ggml_tensor * t = g->nodes[k];
+-        if (t->op == GGML_OP_ADD && t->src[1] == norm->src[0] && p60_is_node(t, "l_out", il)) {
++        if (t->op == GGML_OP_ADD && t->src[1] == norm->src[0] && (p60_is_node(t, "l_out", il) || p60_is_node(t, "mtp_post_ffn", il))) {
+             e = k;
+             break;
+         }
+@@ -4083,7 +4105,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     const ggml_tensor * add = g->nodes[e];
+     if (!router || !sgate || !gate || !up || !down || !sg || !su || !sd || !ids || n_softmax != 1 || n_div != 1 ||
+             T < 1 || T > 6 || ids->ne[0] != 8 || ids->ne[1] != T ||
+-            !p60_mat(router, GGML_TYPE_F32, 2048, 256) || !p60_f32_vec(sgate, 2048) ||
++            !p60_mat_f32ish(router, 2048, 256) || !p60_mat_f32ish(sgate, 2048, 1) ||
+             !p60_mat(gate, GGML_TYPE_Q4_K, 2048, 512, 256) || !p60_mat(up, GGML_TYPE_Q4_K, 2048, 512, 256) ||
+             !p60_mat(down, GGML_TYPE_Q5_K, 512, 2048, 256) ||
+             !p60_mat(sg, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(su, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(sd, GGML_TYPE_Q8_0, 512, 2048) ||
+@@ -4098,7 +4120,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     a.x_in = (const float *) norm->src[0]->data; a.x_out = (float *) add->data;
+     a.norm = (const float *) nmul->src[1]->data;
+     memcpy(&a.eps, norm->op_params, sizeof(float));
+-    a.router = (const float *) router->data; a.sgate = (const float *) sgate->data;
++    a.router = p60_f32_weight(ctx, router); a.sgate = p60_f32_weight(ctx, sgate);
+     a.gate = (const char *) gate->data; a.up = (const char *) up->data; a.down = (const char *) down->data;
+     a.sg = (const char *) sg->data; a.su = (const char *) su->data; a.sd = (const char *) sd->data;
+     if (T == 1) {
+-- 
+2.56.0
+

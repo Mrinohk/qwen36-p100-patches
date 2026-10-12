@@ -1,0 +1,49 @@
+From 285e92e7dfc1b563b55610e30ab67e79807fc21c Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 16:28:27 -0400
+Subject: [PATCH 11/31] cuda : size MoE MMQ tiles by tokens per expert on GP100
+
+mul_mat_q picks its tile width J against ncols_opt, which upstream sets to
+tokens per expert (ne12*n_expert_used/n_expert) only on RDNA3/4 and to all
+tokens (ne12) everywhere else. For a 64-token batch of a 256-expert,
+8-used model that is ~2 tokens per expert in 64-wide tiles, so most of the
+emulated int8 math on sm_60 is on empty columns: every prefill batch paid
+a fixed ~0.45 s. Use the per-expert value on NVIDIA without dp4a too. The
+launch grid still covers ne12, and each output's sum over K does not depend
+on J, so the result is bit-identical. Only with GGML_CUDA_P60_MMVQ=1;
+GGML_CUDA_P60_MMQ_EXPERT_TILE=0 turns it off.
+
+2x P100, Qwen3.6-35B-A3B Q4_K_XL, llama-bench ms per prefill batch, off -> on:
+32 tok 218 -> 132, 64 tok 454 -> 180, 128 tok 582 -> 276, 256 tok 787 -> 456,
+512 tok 1105 -> 792, 1024 tok 1630 -> 1430, 2048/3072 unchanged. A 9.5k-token
+chat prompt with context checkpoints (production server flags): 14.64 ->
+14.06 s. Wikitext perplexity at ub=512 and ub=64 identical to the tile-off
+run, and the per-chunk output matches a tile-off control line for line.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/mmq.cu | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index b13b34ee9..38744b011 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -247,7 +247,13 @@ void ggml_cuda_mul_mat_q(
+     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+     int64_t ncols_opt = ne12;
+-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++    // Same on NVIDIA without dp4a (GP100): with few tokens a tile sized for ne12 is mostly empty columns of emulated
++    // int8 math, which made every small prompt batch cost ~0.45 s. The sums do not depend on the tile width.
++    // Only with GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_MMQ_EXPERT_TILE=0 turns it off.
++    static const bool p60_expert_tile = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++        (getenv("GGML_CUDA_P60_MMQ_EXPERT_TILE") == nullptr || atoi(getenv("GGML_CUDA_P60_MMQ_EXPERT_TILE")) != 0);
++    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
++            (p60_expert_tile && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_DP4A)) {
+         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+     }
+ 
+-- 
+2.56.0
+

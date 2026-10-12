@@ -1,0 +1,178 @@
+From 49fb2a3f345c8f5714123c0cff7fdcdc850e3298 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 14:45:53 -0400
+Subject: [PATCH 10/31] cuda : bit-exact staged-load Q8_0 matvec for one column
+ on sm_60
+
+Stock MMVQ reads every Q8_0 weight int as two 16-bit loads, because 34-byte
+q8_0 blocks are only 2-byte aligned, and on GP100 that is what limits it
+(46 us for a 17.8 MB matrix, 377 GB/s). mul_mat_vec_q8_0_staged keeps stock's
+exact thread -> (row, block, quants) mapping, its accumulation order and its
+reduction (4 warps, 4 rows per block, vdr 2, vec_dot_q8_0_q8_1 itself), so
+the output is bit-identical, but stages the block's 4 rows through shared
+memory with coalesced 16-byte loads, 64 blocks per row at a time, loading the
+next chunk during the math. It reads the same q8_1 activations, so nothing
+else changes.
+
+Taken for Q8_0 x one column, no ids, no fusion, K = 2048 or 4096, rows % 4,
+on pre-Turing NVIDIA with the GENERIC MMVQ table. Only with
+GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_Q8_STAGED=0 turns it off.
+
+Microbenchmark (lab/mmvq/q8exact.cu, bit-diff 0): 17.8 MB 47.2 -> 36.3 us,
+8.9 MB K=2048 25.4 -> 21.2, K=4096 26.2 -> 21.1. 2x P100 decode trace:
+Q8_0 matvecs 4.20 -> 3.36 ms/token, wall 15.08 -> 14.27 ms; the machine
+code is small (5.4/9.4 KB), so the other kernels do not slow down (the
+earlier fp16 Q8_0 kernel at 17 KB cost them 0.43 ms/token, which tracks code
+size: likely instruction cache). llama-bench tg256 80.13 -> 85.95 t/s
+(+7.3%, two rounds); 8-prompt MTP 112.6 -> 113.5 (+0.8%). Wikitext KLD at
+ub=1 vs the previous commit: 0, same top 100%; MTP outputs byte-identical.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/mmvq.cu | 123 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 123 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index ce8397cc2..837ece411 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1482,6 +1482,125 @@ static void mul_mat_vec_q_switch_type(
+     }
+ }
+ 
++// Q8_0 x q8_1, one column, on the GENERIC table (pre-Turing NVIDIA): the same thread -> (row, block, quants) mapping,
++// accumulation order and reduction as mul_mat_vec_q<Q8_0, 1, false> (4 warps, 4 rows per block, vdr 2), so the output
++// is bit-identical, but the block's 4 rows are staged through shared memory with coalesced 16-byte loads, 64 q8_0
++// blocks (2176 bytes) per row at a time, instead of reading every weight int as two 16-bit loads (q8_0 blocks are
++// only 2-byte aligned). The next chunk is loaded into registers during the math. ~20-30% faster on GP100.
++template <int nchunks>
++static __global__ void __launch_bounds__(4*WARP_SIZE, 1) mul_mat_vec_q8_0_staged(
++        const char * __restrict__ vx, const block_q8_1 * __restrict__ y, float * __restrict__ dst, const int64_t row_bytes) {
++    constexpr int qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ, nwarps = 4, rows = 4, warp_size = WARP_SIZE;
++    static_assert(warp_size == 32 && qi/vdr == 4, "mapping assumes 32 lanes and 4 threads per q8_0 block");
++    constexpr int chunk_blocks = 64;                      // q8_0 blocks per row and chunk
++    constexpr int ch  = chunk_blocks*sizeof(block_q8_0)/16; // 136 uint4 per row and chunk
++    constexpr int tot = rows*ch;
++    constexpr int per = (tot + nwarps*warp_size - 1)/(nwarps*warp_size);
++    static_assert(chunk_blocks*sizeof(block_q8_0) % 16 == 0, "");
++
++    __shared__ uint4 sm[tot];
++    const int tid  = warp_size*threadIdx.y + threadIdx.x;
++    const int row0 = rows*blockIdx.x;
++    const int kqs  = vdr * (tid % (qi/vdr));
++
++    uint4 g[per];
++    auto load = [&](const int c) {
++#pragma unroll
++        for (int j = 0; j < per; ++j) {
++            const int idx = tid + nwarps*warp_size*j;
++            if (tot % (nwarps*warp_size) == 0 || idx < tot) {
++                g[j] = __ldg((const uint4 *) (vx + (int64_t) (row0 + idx/ch)*row_bytes) + c*ch + idx % ch);
++            }
++        }
++    };
++    load(0);
++
++    float tmp[rows] = { 0.0f };
++#pragma unroll
++    for (int c = 0; c < nchunks; ++c) {
++        if (c > 0) {
++            __syncthreads();
++        }
++#pragma unroll
++        for (int j = 0; j < per; ++j) {
++            const int idx = tid + nwarps*warp_size*j;
++            if (tot % (nwarps*warp_size) == 0 || idx < tot) {
++                sm[idx] = g[j];
++            }
++        }
++        __syncthreads();
++        if (c + 1 < nchunks) {
++            load(c + 1);
++        }
++        // kbx = tid/4 + 32*n in stock's loop, n = 2*c + it
++#pragma unroll
++        for (int it = 0; it < chunk_blocks*qi/(vdr*nwarps*warp_size); ++it) {
++            const int kl = tid / (qi/vdr) + it*(vdr*nwarps*warp_size/qi);
++#pragma unroll
++            for (int i = 0; i < rows; ++i) {
++                tmp[i] += vec_dot_q8_0_q8_1((const char *) sm + i*ch*16, &y[c*chunk_blocks + kl], kl, kqs);
++            }
++        }
++    }
++
++    __shared__ float tmp_shared[nwarps-1][1][rows][warp_size];
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int i = 0; i < rows; ++i) {
++            tmp_shared[threadIdx.y-1][0][i][threadIdx.x] = tmp[i];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++#pragma unroll
++    for (int i = 0; i < rows; ++i) {
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            tmp[i] += tmp_shared[l][0][i][threadIdx.x];
++        }
++        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
++        if (threadIdx.x == i) {
++            dst[row0 + i] = tmp[i];
++        }
++    }
++}
++
++// Takes the single-column dense Q8_0 case when the staged kernel above reproduces stock exactly; returns false otherwise.
++// Only with GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_Q8_STAGED=0 turns it off.
++static bool mul_mat_vec_q8_0_staged_try(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion, const char * src1_q8_1, cudaStream_t stream) {
++    static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++        (getenv("GGML_CUDA_P60_Q8_STAGED") == nullptr || atoi(getenv("GGML_CUDA_P60_Q8_STAGED")) != 0);
++    if (!enabled || src0->type != GGML_TYPE_Q8_0 || ids != nullptr) {
++        return false;
++    }
++    if (fusion && (fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale)) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_DP4A || get_device_table_id(cc) != MMVQ_PARAMETERS_GENERIC ||
++            calc_nwarps(GGML_TYPE_Q8_0, 1, MMVQ_PARAMETERS_GENERIC) != 4 || calc_rows_per_block(1, MMVQ_PARAMETERS_GENERIC) != 4) {
++        return false;
++    }
++    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];
++    if ((ne00 != 2048 && ne00 != 4096) || ne01 % 4 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[1] != 1 ||
++            src0->nb[1] != (size_t) ne00/QK8_0*sizeof(block_q8_0) || ((uintptr_t) src0->data) % 16 != 0 ||
++            dst->nb[0] != sizeof(float)) {
++        return false;
++    }
++    const dim3 grid(ne01/4), block(WARP_SIZE, 4);
++    if (ne00 == 2048) {
++        mul_mat_vec_q8_0_staged<1><<<grid, block, 0, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1, (float *) dst->data, src0->nb[1]);
++    } else {
++        mul_mat_vec_q8_0_staged<2><<<grid, block, 0, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1, (float *) dst->data, src0->nb[1]);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -1661,6 +1780,10 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    if (mul_mat_vec_q8_0_staged_try(src0, src1, ids, dst, fusion, src1_q8_1_d, stream)) {
++        return;
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+-- 
+2.56.0
+

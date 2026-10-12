@@ -1,0 +1,453 @@
+From b0fddc84e59ac6293b88396963a3cde99c2189b6 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 11:29:31 -0400
+Subject: [PATCH 20/31] cuda : MTP verify output layer and flash attention
+ kernels for sm_60
+
+Two more pieces of the 2..6 token verify pass under GGML_CUDA_P60_MEGA=1:
+
+- Dense q8_0 MUL_MAT with K = 2048 and 2..6 columns (p60-mega-t.cu, called from mmvq-p60): persistent grid, x in
+  shared memory as power-of-2-scaled fp16 like the single-column path, rows streamed in 1088 B chunks. Output layer
+  (248k rows) at 6 columns: 2829 -> 1686 us. GGML_CUDA_P60_Q8T=0 disables it.
+- Flash attention for 2..6 tokens, head size 256, GQA 8, f16 K/V (p60-fa.cu, called from fattn.cu): one block per KV
+  head and position range holds all T x 8 query rows, so K/V are read once (the tile kernel uses 4-token column
+  blocks and converts every fp16 product to fp32 at quarter rate). HFMA2 chains of 32 products flushed to fp32, fp32
+  softmax and accumulators, a second kernel merges the ranges. 6 tokens at 28k context: 710 -> 382 us, at 4k:
+  140 -> 79 us. GGML_CUDA_P60_FA=0 disables it.
+
+2x P100, Qwen3.6-35B-A3B UD-Q4_K_XL, MTP n5 + draft vocab, prod sampler:
+  8 prompts x 256 tokens: 151.2 -> 160.8 t/s
+  28k-token prompt:        ~123 -> ~141 t/s
+test-backend-ops matches the CPU backend for both. Wikitext KLD vs the stock ub=1 base at -ub 6: 0.00420 (previous
+mega path 0.00430, stock 0.00390), same top token 97.55% (stock 97.53%).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/fattn.cu      |   4 +
+ ggml/src/ggml-cuda/mmvq-p60.cu   |   4 +
+ ggml/src/ggml-cuda/p60-fa.cu     | 248 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/p60-mega-t.cu |  93 ++++++++++++
+ ggml/src/ggml-cuda/p60-mega.cuh  |   8 +
+ 5 files changed, 357 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/p60-fa.cu
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 7098c8b4c..f5cad02a5 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1,3 +1,4 @@
++#include "p60-mega.cuh"
+ #include "common.cuh"
+ #include "fattn-common.cuh"
+ #include "fattn-mma-f16.cuh"
+@@ -742,6 +743,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+ 
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
++    if (ggml_cuda_p60_flash_attn_t(ctx, dst)) {
++        return;
++    }
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cu b/ggml/src/ggml-cuda/mmvq-p60.cu
+index 42c50733e..71f218ced 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cu
++++ b/ggml/src/ggml-cuda/mmvq-p60.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq-p60.cuh"
++#include "p60-mega.cuh"
+ #include "unary.cuh"
+ 
+ // A row has NSB superblocks. Lane slot L = sb*4 + q reads superblock sb, quarter q (64 weights, sub-blocks 2q and 2q+1),
+@@ -678,6 +679,9 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+     if (!ids && p60_mul_mat_mc(ctx, src0, src1, dst)) {
+         return true;
+     }
++    if (!ids && src0->ne[1] >= 2048 && ggml_cuda_p60_mul_mat_q8_0_t(ctx, src0, src1, dst)) {
++        return true;
++    }
+     const bool is_q8_0 = src0->type == GGML_TYPE_Q8_0;
+     if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && !is_q8_0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return false;
+diff --git a/ggml/src/ggml-cuda/p60-fa.cu b/ggml/src/ggml-cuda/p60-fa.cu
+new file mode 100644
+index 000000000..a68cef4fd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/p60-fa.cu
+@@ -0,0 +1,248 @@
++#include "p60-mega.cuh"
++
++// Flash attention for 2..6 query tokens (MTP verify) on sm_60, head size 256, GQA 8, f16 K/V (Qwen3.5/3.6 attention
++// layers). The stock tile kernel handles these with 4-token column blocks, so the K/V cache is read twice and every
++// fp16 product is converted to fp32 on its own (quarter rate on sm_60): at 28k context 6 tokens cost ~5x one token.
++// Here one block owns one KV head and a contiguous range of KV positions for all T x 8 query rows, so K/V are read
++// once. Q.K and P.V are HFMA2 chains of 32 products flushed to fp32; softmax state and the output accumulators are
++// fp32. A second kernel merges the per-range partial results.
++
++namespace {
++namespace fa {
++
++constexpr int D = 256, G = 8, TILE = 32, NTH = G * 32, KS = D + 8; // KS: padded smem row (halves)
++constexpr int TM = 6, MAXSPLIT = 64;
++
++struct Params {
++    const float * Q; int64_t q_t, q_h;          // floats: token, head strides
++    const half  * K; int64_t k_p, k_h;          // halves: position, head strides
++    const half  * V; int64_t v_p, v_h;
++    const half  * mask; int64_t m_t;            // halves: token stride (row of positions)
++    int L, chunk, nsplit;
++    float scale;
++    float * part;                               // [nsplit][kvh][T][G][D]
++    float2 * ml;                                // [nsplit][kvh][T][G] (max, sum)
++};
++
++template <int T>
++__global__ void __launch_bounds__(NTH, 1) fa_t_kernel(const Params P) {
++    __shared__ __align__(16) half qs[T * G][D];
++    __shared__ __align__(16) half kv[TILE][KS];
++    __shared__ __align__(16) half ps[T * G][TILE];
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5; // warp w = query head within the group
++    const int split = blockIdx.x, kvh = blockIdx.y;
++    const int p0 = split * P.chunk, p1 = min(P.L, p0 + P.chunk);
++
++    for (int i = threadIdx.x; i < T * G * D / 2; i += NTH) {
++        const int r = i / (D / 2), d = 2 * (i % (D / 2)), t = r / G, j = r % G;
++        const float2 q = *(const float2 *) (P.Q + t * P.q_t + (kvh * G + j) * P.q_h + d);
++        *(half2 *) &qs[r][d] = __floats2half2_rn(q.x, q.y);
++    }
++    const half * Kh = P.K + kvh * P.k_h;
++    const half * Vh = P.V + kvh * P.v_h;
++
++    float m[T], l[T], acc[T][8];
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        m[t] = -INFINITY; l[t] = 0.f;
++#pragma unroll
++        for (int i = 0; i < 8; i++) acc[t][i] = 0.f;
++    }
++    // tile loads: 32 rows x 32 uint4, thread i takes chunks i, i + 256, i + 512, i + 768
++    auto ld_tile = [&](const half * base, int64_t stride, int p, uint4 * reg) {
++#pragma unroll
++        for (int c = 0; c < 4; c++) {
++            const int idx = threadIdx.x + NTH * c, row = idx / 32, col = idx % 32;
++            reg[c] = p + row < p1 ? __ldg((const uint4 *) (base + (int64_t) (p + row) * stride) + col) : make_uint4(0, 0, 0, 0);
++        }
++    };
++    auto st_tile = [&](const uint4 * reg) {
++#pragma unroll
++        for (int c = 0; c < 4; c++) {
++            const int idx = threadIdx.x + NTH * c, row = idx / 32, col = idx % 32;
++            *(uint4 *) &kv[row][8 * col] = reg[c];
++        }
++    };
++    uint4 kreg[4], vreg[4];
++    if (p0 < p1) ld_tile(Kh, P.k_p, p0, kreg);
++    for (int p = p0; p < p1; p += TILE) {
++        __syncthreads(); // previous tile's P.V done with kv
++        st_tile(kreg);
++        ld_tile(Vh, P.v_p, p, vreg);
++        __syncthreads();
++        // ---- scores: lane = position, warp w: rows (t, w) ----
++        float s[T];
++        {
++            float f[T];
++            half2 a[T];
++#pragma unroll
++            for (int t = 0; t < T; t++) { f[t] = 0.f; a[t] = __float2half2_rn(0.f); }
++#pragma unroll 4
++            for (int d = 0; d < D; d += 8) {
++                const uint4 k4 = *(const uint4 *) &kv[lane][d];
++#pragma unroll
++                for (int t = 0; t < T; t++) {
++                    const uint4 q4 = *(const uint4 *) &qs[t * G + w][d];
++                    a[t] = __hfma2(*(const half2 *) &k4.x, *(const half2 *) &q4.x, a[t]);
++                    a[t] = __hfma2(*(const half2 *) &k4.y, *(const half2 *) &q4.y, a[t]);
++                    a[t] = __hfma2(*(const half2 *) &k4.z, *(const half2 *) &q4.z, a[t]);
++                    a[t] = __hfma2(*(const half2 *) &k4.w, *(const half2 *) &q4.w, a[t]);
++                }
++                if ((d & 31) == 24) { // flush every 32 elements
++#pragma unroll
++                    for (int t = 0; t < T; t++) { const float2 v = __half22float2(a[t]); f[t] += v.x + v.y; a[t] = __float2half2_rn(0.f); }
++                }
++            }
++            const int pos = p + lane;
++#pragma unroll
++            for (int t = 0; t < T; t++) {
++                const float mk = pos < p1 ? __half2float(P.mask[t * P.m_t + pos]) : -INFINITY;
++                s[t] = f[t] * P.scale + mk;
++            }
++        }
++        // ---- online softmax per row (state replicated in all lanes) ----
++        float alpha[T];
++#pragma unroll
++        for (int t = 0; t < T; t++) {
++            float mt = s[t];
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffff, mt, o));
++            const float mn = fmaxf(m[t], mt);
++            const float pr = mn == -INFINITY ? 0.f : __expf(s[t] - mn);
++            alpha[t] = mn == -INFINITY ? 1.f : __expf(m[t] - mn);
++            float sum = pr;
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
++            l[t] = l[t] * alpha[t] + sum;
++            m[t] = mn;
++            ps[t * G + w][lane] = __float2half(pr);
++        }
++        __syncthreads(); // K reads done, probabilities visible
++        st_tile(vreg);
++        if (p + TILE < p1) ld_tile(Kh, P.k_p, p + TILE, kreg);
++        __syncthreads();
++        // ---- P.V: lane owns d = 8 lane .. 8 lane + 7 ----
++        {
++            half2 a[T][4];
++#pragma unroll
++            for (int t = 0; t < T; t++)
++#pragma unroll
++                for (int i = 0; i < 4; i++) a[t][i] = __float2half2_rn(0.f);
++#pragma unroll 8
++            for (int j = 0; j < TILE; j++) {
++                const uint4 v4 = *(const uint4 *) &kv[j][8 * lane];
++#pragma unroll
++                for (int t = 0; t < T; t++) {
++                    const half2 pp = __half2half2(ps[t * G + w][j]);
++                    a[t][0] = __hfma2(*(const half2 *) &v4.x, pp, a[t][0]);
++                    a[t][1] = __hfma2(*(const half2 *) &v4.y, pp, a[t][1]);
++                    a[t][2] = __hfma2(*(const half2 *) &v4.z, pp, a[t][2]);
++                    a[t][3] = __hfma2(*(const half2 *) &v4.w, pp, a[t][3]);
++                }
++            }
++#pragma unroll
++            for (int t = 0; t < T; t++)
++#pragma unroll
++                for (int i = 0; i < 4; i++) {
++                    const float2 v = __half22float2(a[t][i]);
++                    acc[t][2 * i]     = acc[t][2 * i]     * alpha[t] + v.x;
++                    acc[t][2 * i + 1] = acc[t][2 * i + 1] * alpha[t] + v.y;
++                }
++        }
++    }
++    const int nkvh = gridDim.y;
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        const int64_t row = (((int64_t) split * nkvh + kvh) * T + t) * G + w;
++        float4 * o = (float4 *) (P.part + row * D + 8 * lane);
++        o[0] = make_float4(acc[t][0], acc[t][1], acc[t][2], acc[t][3]);
++        o[1] = make_float4(acc[t][4], acc[t][5], acc[t][6], acc[t][7]);
++        if (lane == 0) P.ml[row] = make_float2(m[t], l[t]);
++    }
++}
++
++// one block per (token, query head): merge the ranges, normalize, write dst [D][heads][tokens]
++__global__ void __launch_bounds__(D) fa_combine(const float * part, const float2 * ml, int nsplit, int nkvh, int T,
++        float * dst, int64_t d_h, int64_t d_t) {
++    const int t = blockIdx.x / (nkvh * G), h = blockIdx.x % (nkvh * G), kvh = h / G, j = h % G;
++    __shared__ float wgt[MAXSPLIT];
++    __shared__ float inv;
++    if (threadIdx.x < 32) {
++        float M = -INFINITY;
++        for (int s = threadIdx.x; s < nsplit; s += 32) M = fmaxf(M, ml[(((int64_t) s * nkvh + kvh) * T + t) * G + j].x);
++        for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffff, M, o));
++        float S = 0.f;
++        for (int s = threadIdx.x; s < nsplit; s += 32) {
++            const float2 v = ml[(((int64_t) s * nkvh + kvh) * T + t) * G + j];
++            const float e = v.x == -INFINITY ? 0.f : __expf(v.x - M);
++            wgt[s] = e;
++            S += e * v.y;
++        }
++        for (int o = 16; o > 0; o >>= 1) S += __shfl_xor_sync(0xffffffff, S, o);
++        if (threadIdx.x == 0) inv = S > 0.f ? 1.f / S : 0.f;
++    }
++    __syncthreads();
++    float y = 0.f;
++    for (int s = 0; s < nsplit; s++) y += wgt[s] * part[((((int64_t) s * nkvh + kvh) * T + t) * G + j) * D + threadIdx.x];
++    dst[t * d_t + h * d_h + threadIdx.x] = y * inv;
++}
++
++} // namespace fa
++} // namespace
++
++bool ggml_cuda_p60_flash_attn_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    using namespace fa;
++    static const bool enabled = getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0 &&
++        (getenv("GGML_CUDA_P60_FA") == nullptr || atoi(getenv("GGML_CUDA_P60_FA")) != 0);
++    const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2], * mask = dst->src[3];
++    if (!enabled || ggml_cuda_info().devices[ctx.device].cc != 600 || dst->src[4] != nullptr || mask == nullptr) {
++        return false;
++    }
++    float scale, max_bias, softcap;
++    memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
++    const int64_t T = Q->ne[1];
++    if (max_bias != 0.0f || softcap != 0.0f || T < 2 || T > TM || Q->ne[0] != D || K->ne[0] != D || V->ne[0] != D ||
++            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
++            dst->type != GGML_TYPE_F32 || Q->ne[2] != G * K->ne[2] || V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1] ||
++            Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->ne[0] < K->ne[1] ||
++            mask->ne[1] < T || dst->ne[0] != D || dst->ne[1] != Q->ne[2] || dst->ne[2] != T ||
++            Q->nb[0] != sizeof(float) || Q->nb[1] % 8 != 0 || Q->nb[2] % 8 != 0 || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) ||
++            K->nb[1] % 16 != 0 || K->nb[2] % 16 != 0 || V->nb[1] % 16 != 0 || V->nb[2] % 16 != 0 ||
++            ((uintptr_t) K->data) % 16 != 0 || ((uintptr_t) V->data) % 16 != 0 || ((uintptr_t) Q->data) % 8 != 0 ||
++            dst->nb[0] != sizeof(float) || mask->nb[0] != sizeof(half)) {
++        return false;
++    }
++    const int nkvh = (int) K->ne[2];
++    const int L    = (int) K->ne[1];
++    // ranges of whole tiles; about one block per SM in total, at least 2 tiles per range
++    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
++    const int ntile  = (L + TILE - 1) / TILE;
++    int nsplit = std::max(1, std::min({ nsm / nkvh, ntile / 2, MAXSPLIT }));
++    const int chunk = ((ntile + nsplit - 1) / nsplit) * TILE;
++    nsplit = (L + chunk - 1) / chunk;
++
++    ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) nsplit * nkvh * T * G * D);
++    ggml_cuda_pool_alloc<float2> ml(ctx.pool(), (size_t) nsplit * nkvh * T * G);
++    Params p = {};
++    p.Q = (const float *) Q->data; p.q_t = Q->nb[1] / sizeof(float); p.q_h = Q->nb[2] / sizeof(float);
++    p.K = (const half *) K->data;  p.k_p = K->nb[1] / sizeof(half);  p.k_h = K->nb[2] / sizeof(half);
++    p.V = (const half *) V->data;  p.v_p = V->nb[1] / sizeof(half);  p.v_h = V->nb[2] / sizeof(half);
++    p.mask = (const half *) mask->data; p.m_t = mask->nb[1] / sizeof(half);
++    p.L = L; p.chunk = chunk; p.nsplit = nsplit; p.scale = scale;
++    p.part = part.get(); p.ml = ml.get();
++    const dim3 grid(nsplit, nkvh);
++    cudaStream_t st = ctx.stream();
++    switch (T) {
++        case 2: fa_t_kernel<2><<<grid, NTH, 0, st>>>(p); break;
++        case 3: fa_t_kernel<3><<<grid, NTH, 0, st>>>(p); break;
++        case 4: fa_t_kernel<4><<<grid, NTH, 0, st>>>(p); break;
++        case 5: fa_t_kernel<5><<<grid, NTH, 0, st>>>(p); break;
++        case 6: fa_t_kernel<6><<<grid, NTH, 0, st>>>(p); break;
++    }
++    fa_combine<<<T * nkvh * G, D, 0, st>>>(p.part, p.ml, nsplit, nkvh, (int) T, (float *) dst->data,
++        dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/p60-mega-t.cu b/ggml/src/ggml-cuda/p60-mega-t.cu
+index 3c86b9a11..a5f252a6d 100644
+--- a/ggml/src/ggml-cuda/p60-mega-t.cu
++++ b/ggml/src/ggml-cuda/p60-mega-t.cu
+@@ -786,6 +786,78 @@ __global__ void __launch_bounds__(NT, 1) gdn_t_kernel(const Params P) {
+ 
+ } // namespace gdn
+ 
++// ================= dense q8_0 matvec, 2..6 columns (K = 2048) =================
++// For the MTP verify: the output layer (248k rows) and the attention projections. Persistent grid of one block per SM;
++// each block keeps the T columns of x in shared memory as fp16 scaled by a power of 2 (max |x| in [16, 32), as the
++// single-column mmvq-p60 path does), each warp streams whole rows in 1088 B chunks with the next two in registers.
++namespace q8t {
++using namespace mt;
++
++constexpr int K = 2048, XS = K + K / 16, HALF = 1088;
++
++template <int T>
++__global__ void __launch_bounds__(NT, 1) q8_0_t_kernel(const uint8_t * __restrict__ W, const int64_t nb01, const int nrows,
++        const float * __restrict__ x, const int64_t s11, float * __restrict__ dst, const int64_t s1) {
++    __shared__ __align__(16) __half xs16[TM * XS];
++    __shared__ __align__(16) uint8_t stage[NW][HALF];
++    __shared__ float inv[TM];
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    if (warp < T) {
++        const int t = warp, k0 = 64 * lane;
++        float4 xv[16];
++#pragma unroll
++        for (int i = 0; i < 16; i++) xv[i] = __ldg((const float4 *) (x + t * s11 + k0 + 4 * i));
++        float m = 0.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) m = fmaxf(m, fmaxf(fmaxf(fabsf(xv[i].x), fabsf(xv[i].y)), fmaxf(fabsf(xv[i].z), fabsf(xv[i].w))));
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
++        int e = 0;
++        frexpf(m, &e);
++        const float sc = m > 0.f ? ldexpf(1.f, 5 - e) : 1.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) {
++            const float v[4] = {xv[i].x, xv[i].y, xv[i].z, xv[i].w};
++#pragma unroll
++            for (int c = 0; c < 4; c++) xs16[t * XS + pp(k0 + 4 * i + c)] = __float2half(v[c] * sc);
++        }
++        if (lane == 0) inv[t] = 1.f / sc;
++    }
++    __syncthreads();
++    const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
++    const int nt = gw < nrows ? 2 * ((nrows - gw + nwg - 1) / nwg) : 0;
++    auto ld = [&](int c, int4 * bb) {
++        const int4 * p = (const int4 *) (W + (int64_t) (gw + (c >> 1) * nwg) * nb01 + (c & 1) * HALF);
++        bb[0] = __ldg(p + lane); bb[1] = __ldg(p + 32 + lane); if (lane < 4) bb[2] = __ldg(p + 64 + lane);
++    };
++    int4 b0[3], b1[3];
++    if (nt > 0) ld(0, b0);
++    if (nt > 1) ld(1, b1);
++    float acc[TM];
++#pragma unroll
++    for (int t = 0; t < TM; t++) acc[t] = 0.f;
++    for (int c = 0; c < nt; c++) {
++        int4 * st = (int4 *) stage[warp];
++        st[lane] = b0[0]; st[32 + lane] = b0[1]; if (lane < 4) st[64 + lane] = b0[2];
++        __syncwarp();
++        b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++        if (c + 2 < nt) ld(c + 2, b1);
++        dot_q8h<T>(stage[warp], lane, 32 * (c & 1) + lane, xs16, XS, acc);
++        __syncwarp();
++        if (c & 1) {
++            const int r = gw + (c >> 1) * nwg;
++#pragma unroll
++            for (int t = 0; t < T; t++) {
++                const float a = wsum(acc[t]);
++                acc[t] = 0.f;
++                if (lane == 0) dst[t * s1 + r] = a * inv[t];
++            }
++        }
++    }
++}
++
++} // namespace q8t
++
+ 
+ unsigned * mega_bar(ggml_backend_cuda_context & ctx) {
+     if (ctx.p60_mega_bar == nullptr) {
+@@ -859,3 +931,24 @@ void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+                                            (const void *) gdn_t_kernel<4>, (const void *) gdn_t_kernel<5>, (const void *) gdn_t_kernel<6> };
+     mega_launch(ctx, kern[n_tokens - 1], kp, 3);
+ }
++
++bool ggml_cuda_p60_mul_mat_q8_0_t(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    using namespace q8t;
++    static const bool enabled = getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0 &&
++        (getenv("GGML_CUDA_P60_Q8T") == nullptr || atoi(getenv("GGML_CUDA_P60_Q8T")) != 0);
++    const int64_t T = src1->ne[1];
++    if (!enabled || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++            src0->ne[0] != K || T < 2 || T > TM || dst->ne[1] != T || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 ||
++            ((uintptr_t) src1->data) % 16 != 0 || src0->nb[1] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0 ||
++            dst->nb[0] != sizeof(float) || src0->ne[1] > INT_MAX) {
++        return false;
++    }
++    const int nblk = ggml_cuda_info().devices[ctx.device].nsm;
++    static void (* const kern[TM])(const uint8_t *, int64_t, int, const float *, int64_t, float *, int64_t) = {
++        nullptr, q8_0_t_kernel<2>, q8_0_t_kernel<3>, q8_0_t_kernel<4>, q8_0_t_kernel<5>, q8_0_t_kernel<6> };
++    kern[T - 1]<<<nblk, mt::NT, 0, ctx.stream()>>>((const uint8_t *) src0->data, src0->nb[1], (int) src0->ne[1],
++        (const float *) src1->data, src1->nb[1] / sizeof(float), (float *) dst->data, dst->nb[1] / sizeof(float));
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+index 2e2c6c16c..508805f40 100644
+--- a/ggml/src/ggml-cuda/p60-mega.cuh
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -61,3 +61,11 @@ void ggml_cuda_p60_mega_moe(ggml_backend_cuda_context & ctx, const ggml_cuda_p60
+ void ggml_cuda_p60_mega_moe_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args, int n_tokens);
+ void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args, int n_tokens, int n_snap,
+         int64_t cs_slot, int64_t ss_slot);
++
++// dense q8_0 MUL_MAT with K = 2048 and 2..6 columns (MTP verify: output layer, attention projections), fp16 x scaled
++// as in mmvq-p60. Returns false if not applicable. Needs GGML_CUDA_P60_MEGA=1; GGML_CUDA_P60_Q8T=0 disables it.
++bool ggml_cuda_p60_mul_mat_q8_0_t(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++
++// flash attention for 2..6 query tokens (MTP verify), head size 256, GQA 8, f16 K/V, on sm_60 (p60-fa.cu): K/V are read
++// once for all query rows. Returns false if not applicable. Needs GGML_CUDA_P60_MEGA=1; GGML_CUDA_P60_FA=0 disables it.
++bool ggml_cuda_p60_flash_attn_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+-- 
+2.56.0
+

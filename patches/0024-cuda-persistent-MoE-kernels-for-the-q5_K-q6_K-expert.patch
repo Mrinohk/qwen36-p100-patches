@@ -1,0 +1,284 @@
+From 1261945a7bcd734920ac0c9037b9a7489c16b8b8 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 12:28:57 -0400
+Subject: [PATCH 24/31] cuda : persistent MoE kernels for the q5_K / q6_K
+ expert layers on sm_60
+
+Three layers of Qwen3.6-35B-A3B UD-Q4_K_XL have other expert types (34, 38: q6_K down; 39: q5_K gate / up, q6_K
+down) and still ran the stock MoE path. The multi-token MoE kernel gets
+- q5_K gate / up rows: lanes load their 64 weights directly (1408 B rows do not fit the staging buffer), next row in
+  flight during the current row's math;
+- q6_K down rows: 210 B superblocks leave the second superblock of a row 2 B aligned, so lanes load aligned words
+  and funnel-shift; 6-bit quants minus 32 go straight to half2 pairs, 4 int8 scales per 64 weights.
+The single-token case of these layers uses the multi-token kernel at T = 1.
+
+2x P100, Qwen3.6-35B-A3B UD-Q4_K_XL: no speculation tg128 120.2 -> 125.7 t/s; MTP prod sampler 8 x 256: 179.2 t/s
+(acceptance varied, 171.8 before). Wikitext KLD vs the stock ub=1 base: ub=6 0.00422, ub=1 0.00434 (both slightly
+lower than before).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  10 +-
+ ggml/src/ggml-cuda/p60-mega-t.cu | 168 ++++++++++++++++++++++++++-----
+ ggml/src/ggml-cuda/p60-mega.cuh  |   2 +
+ 3 files changed, 151 insertions(+), 29 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3eeffe445..c1d7a33cf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4106,8 +4106,11 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     if (!router || !sgate || !gate || !up || !down || !sg || !su || !sd || !ids || n_softmax != 1 || n_div != 1 ||
+             T < 1 || T > 6 || ids->ne[0] != 8 || ids->ne[1] != T ||
+             !p60_mat_f32ish(router, 2048, 256) || !p60_mat_f32ish(sgate, 2048, 1) ||
+-            !p60_mat(gate, GGML_TYPE_Q4_K, 2048, 512, 256) || !p60_mat(up, GGML_TYPE_Q4_K, 2048, 512, 256) ||
+-            !p60_mat(down, GGML_TYPE_Q5_K, 512, 2048, 256) ||
++            // gate / up q4_K (q5_K in some layers), down q5_K (q6_K); q5_K gate / up only with q6_K down
++            !gate || !up || gate->type != up->type || (gate->type == GGML_TYPE_Q5_K && down->type != GGML_TYPE_Q6_K) ||
++            !(p60_mat(gate, GGML_TYPE_Q4_K, 2048, 512, 256) || p60_mat(gate, GGML_TYPE_Q5_K, 2048, 512, 256)) ||
++            !(p60_mat(up, GGML_TYPE_Q4_K, 2048, 512, 256) || p60_mat(up, GGML_TYPE_Q5_K, 2048, 512, 256)) ||
++            !(p60_mat(down, GGML_TYPE_Q5_K, 512, 2048, 256) || p60_mat(down, GGML_TYPE_Q6_K, 512, 2048, 256)) ||
+             !p60_mat(sg, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(su, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(sd, GGML_TYPE_Q8_0, 512, 2048) ||
+             !p60_f32_vec(nmul->src[1], 2048) || !p60_f32_vec(norm->src[0], 2048*T) || !p60_f32_vec(add, 2048*T) ||
+             !p60_range_private(g, i, e, add)) {
+@@ -4123,7 +4126,8 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     a.router = p60_f32_weight(ctx, router); a.sgate = p60_f32_weight(ctx, sgate);
+     a.gate = (const char *) gate->data; a.up = (const char *) up->data; a.down = (const char *) down->data;
+     a.sg = (const char *) sg->data; a.su = (const char *) su->data; a.sd = (const char *) sd->data;
+-    if (T == 1) {
++    a.gate_type = gate->type; a.down_type = down->type;
++    if (T == 1 && gate->type == GGML_TYPE_Q4_K && down->type == GGML_TYPE_Q5_K) {
+         ggml_cuda_p60_mega_moe(*ctx, a);
+     } else {
+         ggml_cuda_p60_mega_moe_t(*ctx, a, (int) T);
+diff --git a/ggml/src/ggml-cuda/p60-mega-t.cu b/ggml/src/ggml-cuda/p60-mega-t.cu
+index 38a19c3bd..5e67adc7d 100644
+--- a/ggml/src/ggml-cuda/p60-mega-t.cu
++++ b/ggml/src/ggml-cuda/p60-mega-t.cu
+@@ -19,6 +19,7 @@ using namespace mt;
+ constexpr int P3_ROW_COST = 4;
+ constexpr int D = 2048, NE = 256, NU = 8, FF = 512;
+ constexpr int Q4K_ROW = D / 256 * 144, Q5K_ROW = FF / 256 * 176, Q8_ROW_D = D / 32 * 34, Q8_ROW_F = FF / 32 * 34, HALF = 1088;
++constexpr int Q5K_ROW_D = D / 256 * 176, Q6K_ROW = FF / 256 * 210; // q5_K gate / up rows, q6_K down rows (some layers)
+ constexpr int XS = D + D / 16;       // padded row length (px) of a token's x
+ constexpr int AS = FF + FF / 16;     // padded row length (px) of a swiglu vector
+ constexpr int MAXU = TM * NU;        // union size bound
+@@ -111,8 +112,70 @@ __device__ __forceinline__ float dot1(const w64 & w, const __half * x16, int bas
+     return w.dl * h2sum(al) + w.dh * h2sum(ah) - (w.ml * sl + w.mh * sh);
+ }
+ 
++// ---- q6_K (down rows of some layers): 210 B superblocks, so the second superblock of a 420 B row is only 2 B aligned.
++// Lane chunk q of a superblock = 64 weights: half n = q / 2 of the superblock, part q % 2: part 0 = low nibbles of
++// ql[64 n ..] with qh bits 0-1 / 2-3, part 1 = high nibbles with bits 4-5 / 6-7; 4 int8 scales per lane (16 weights each).
++struct q6_ld { unsigned ql[17], qh[9], sc[2]; unsigned short d; };
++__device__ __forceinline__ q6_ld load_q6k(const uint8_t * b, int q) {
++    const int n = q >> 1, part = q & 1;
++    const unsigned * ql = (const unsigned *) ((uintptr_t) (b + 64 * n) & ~(uintptr_t) 3);
++    const unsigned * qh = (const unsigned *) ((uintptr_t) (b + 128 + 32 * n) & ~(uintptr_t) 3);
++    const unsigned * sc = (const unsigned *) ((uintptr_t) (b + 192 + 8 * n + 4 * part) & ~(uintptr_t) 3);
++    const bool mis = ((uintptr_t) b) & 2; // the same for all fields of the superblock
++    q6_ld L;
++#pragma unroll
++    for (int k = 0; k < 16; k++) L.ql[k] = __ldg(ql + k);
++    L.ql[16] = mis ? __ldg(ql + 16) : 0u;
++#pragma unroll
++    for (int k = 0; k < 8; k++) L.qh[k] = __ldg(qh + k);
++    L.qh[8] = mis ? __ldg(qh + 8) : 0u;
++    L.sc[0] = __ldg(sc);
++    L.sc[1] = mis ? __ldg(sc + 1) : 0u;
++    L.d = __ldg((const unsigned short *) (b + 208));
++    return L;
++}
++struct w66 { half2 l02[8], l13[8], h02[8], h13[8]; float s[4]; };
++__device__ __forceinline__ half2 q6h2(unsigned v) { // two 6-bit values at bits 0-5 and 16-21 -> half2 of (value - 32)
++    return __hsub2(*(const half2 *) &(const unsigned &) (v | 0x64006400u), __halves2half2(__ushort_as_half(0x6420), __ushort_as_half(0x6420)));
++}
++__device__ __forceinline__ void prep_q6k(const q6_ld & L, const uint8_t * b, int q, w66 & w) {
++    const int part = q & 1;
++    const unsigned sh = (((uintptr_t) b) & 2) * 8;
++    const int ns = 4 * part;
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const unsigned v1 = __funnelshift_r(L.ql[i], L.ql[i + 1], sh), v2 = __funnelshift_r(L.ql[i + 8], L.ql[i + 9], sh);
++        const unsigned vh = __funnelshift_r(L.qh[i], L.qh[i + 1], sh);
++        const unsigned lo1 = (v1 >> ns) & 0x0F0F0F0F, lo2 = (v2 >> ns) & 0x0F0F0F0F;
++        const unsigned q1 = lo1 | (((vh >> ns) & 0x03030303) << 4), q2 = lo2 | (((vh >> (ns + 2)) & 0x03030303) << 4);
++        w.l02[i] = q6h2(q1 & 0x00FF00FF); w.l13[i] = q6h2((q1 >> 8) & 0x00FF00FF);
++        w.h02[i] = q6h2(q2 & 0x00FF00FF); w.h13[i] = q6h2((q2 >> 8) & 0x00FF00FF);
++    }
++    const unsigned scw = __funnelshift_r(L.sc[0], L.sc[1], sh);
++    const float d = __half2float(__ushort_as_half(L.d));
++#pragma unroll
++    for (int k = 0; k < 4; k++) w.s[k] = d * (float) (int8_t) (scw >> (8 * k));
++}
++// one token against a q6_K lane chunk: weights 0..31 of the chunk at element base.., 32..63 at base + 32..
++__device__ __forceinline__ float dot6(const w66 & w, const __half * x16, int base) {
++    half2 a[4];
++#pragma unroll
++    for (int k = 0; k < 4; k++) a[k] = __float2half2_rn(0.f);
++    const __half * xb = x16 + px(base);
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const uint2 lo = *(const uint2 *) (xb + 4 * i), hi = *(const uint2 *) (xb + 32 + 4 * i);
++        a[i >> 2]       = __hfma2(w.l02[i], *(const half2 *) &lo.x, a[i >> 2]);
++        a[i >> 2]       = __hfma2(w.l13[i], *(const half2 *) &lo.y, a[i >> 2]);
++        a[2 + (i >> 2)] = __hfma2(w.h02[i], *(const half2 *) &hi.x, a[2 + (i >> 2)]);
++        a[2 + (i >> 2)] = __hfma2(w.h13[i], *(const half2 *) &hi.y, a[2 + (i >> 2)]);
++    }
++    return w.s[0] * h2sum(a[0]) + w.s[1] * h2sum(a[1]) + w.s[2] * h2sum(a[2]) + w.s[3] * h2sum(a[3]);
++}
++
+ 
+-template <int TT>
++// GU5: gate / up rows are q5_K (else q4_K); DN6: down rows are q6_K (else q5_K)
++template <int TT, bool GU5, bool DN6>
+ __global__ void __launch_bounds__(NT, 1) moe_t_kernel(const Params P) {
+     // region A: P0-P2 xs16 [TM][XS]; P3 act16 [2 experts * TM][AS] + shared act16 [TM][AS]
+     __shared__ __align__(16) __half regA[TM * XS];
+@@ -255,7 +318,7 @@ __global__ void __launch_bounds__(NT, 1) moe_t_kernel(const Params P) {
+     const int U = nU;
+ 
+     // ---- P2: expert gate/up rows of the union: rows streamed with coalesced 16 B loads, next 2 rows in registers ----
+-    {
++    if constexpr (!GU5) {
+         const int N2 = U * 2 * FF;
+         auto q4row = [&](int v) {
+             const int u = v / (2 * FF), j = v % (2 * FF);
+@@ -288,6 +351,32 @@ __global__ void __launch_bounds__(NT, 1) moe_t_kernel(const Params P) {
+                 if (lane == 0) P.egu[((size_t) u * TM + t) * 2 * FF + j] = a;
+             }
+         }
++    } else {
++        // q5_K rows (1408 B) do not fit the staging buffer: lane (superblock, quarter) loads its 64 weights directly,
++        // the next row's loads in flight during this row's math
++        const int N2 = U * 2 * FF;
++        const int sbk = lane >> 2, q = lane & 3;
++        auto q5row = [&](int v) {
++            const int u = v / (2 * FF), j = v % (2 * FF);
++            return load_q5k((j < FF ? W.gate : W.up) + ((size_t) ulist[u] * FF + (j % FF)) * Q5K_ROW_D + sbk * 176, q);
++        };
++        int v = gw;
++        q5_ld Lc;
++        if (v < N2) Lc = q5row(v);
++        for (; v < N2; v += nwg) {
++            q5_ld Ln;
++            if (v + nwg < N2) Ln = q5row(v + nwg);
++            const int u = v / (2 * FF), j = v % (2 * FF);
++            w64 w;
++            prep_q5k(Lc, q, w);
++            Lc = Ln;
++            const int base = sbk * 256 + 64 * q, j0 = base >> 5;
++            for (unsigned m = umaskl[u]; m; m &= m - 1) {
++                const int t = __ffs(m) - 1;
++                const float a = wsum(dot1(w, xs16 + t * XS, base, xsum[t * 64 + j0], xsum[t * 64 + j0 + 1]));
++                if (lane == 0) P.egu[((size_t) u * TM + t) * 2 * FF + j] = a;
++            }
++        }
+     }
+     tsync(P.bar, target);
+ 
+@@ -354,27 +443,49 @@ __global__ void __launch_bounds__(NT, 1) moe_t_kernel(const Params P) {
+         __syncthreads();
+         // groups of 4 rows per warp: lane = row in group * 8 + superblock * 4 + chunk
+         const int sb = (lane >> 2) & 1, q = lane & 3, ri = lane >> 3;
+-        auto q5at = [&](int g) { return load_q5k(W.down + ((size_t) ulist[g / D] * D + g % D + ri) * Q5K_ROW + sb * 176, q); };
+-        int g0 = r0 + 4 * warp;
+-        q5_ld Lc;
+-        if (g0 < r1) Lc = q5at(g0);
+-        for (; g0 < r1; g0 += 4 * NW) {
+-            q5_ld Ln;
+-            if (g0 + 4 * NW < r1) Ln = q5at(g0 + 4 * NW); // next group's loads in flight during this group's math
+-            const int u = g0 / D, r = g0 % D + ri;
+-            w64 w;
+-            prep_q5k(Lc, q, w);
+-            Lc = Ln;
+-            const int base = sb * 256 + 64 * q, j0 = base >> 5;
+-            const __half * a16 = act16 + (u - ulo) * TM * AS;
+-            const float * as = asum + (u - ulo) * TM * 16;
+-            for (unsigned m = umaskl[u]; m; m &= m - 1) {
+-                const int t = __ffs(m) - 1;
+-                float a = dot1(w, a16 + t * AS, base, as[t * 16 + j0], as[t * 16 + j0 + 1]);
+-                a += __shfl_xor_sync(0xffffffff, a, 4); a += __shfl_xor_sync(0xffffffff, a, 2); a += __shfl_xor_sync(0xffffffff, a, 1);
+-                if ((lane & 7) == 0) {
+-                    const int k = kof[u][t];
+-                    P.ypart[((size_t) t * NU + k) * D + r] = selw[t][k] * a;
++        if constexpr (!DN6) {
++            auto q5at = [&](int g) { return load_q5k(W.down + ((size_t) ulist[g / D] * D + g % D + ri) * Q5K_ROW + sb * 176, q); };
++            int g0 = r0 + 4 * warp;
++            q5_ld Lc;
++            if (g0 < r1) Lc = q5at(g0);
++            for (; g0 < r1; g0 += 4 * NW) {
++                q5_ld Ln;
++                if (g0 + 4 * NW < r1) Ln = q5at(g0 + 4 * NW); // next group's loads in flight during this group's math
++                const int u = g0 / D, r = g0 % D + ri;
++                w64 w;
++                prep_q5k(Lc, q, w);
++                Lc = Ln;
++                const int base = sb * 256 + 64 * q, j0 = base >> 5;
++                const __half * a16 = act16 + (u - ulo) * TM * AS;
++                const float * as = asum + (u - ulo) * TM * 16;
++                for (unsigned m = umaskl[u]; m; m &= m - 1) {
++                    const int t = __ffs(m) - 1;
++                    float a = dot1(w, a16 + t * AS, base, as[t * 16 + j0], as[t * 16 + j0 + 1]);
++                    a += __shfl_xor_sync(0xffffffff, a, 4); a += __shfl_xor_sync(0xffffffff, a, 2); a += __shfl_xor_sync(0xffffffff, a, 1);
++                    if ((lane & 7) == 0) {
++                        const int k = kof[u][t];
++                        P.ypart[((size_t) t * NU + k) * D + r] = selw[t][k] * a;
++                    }
++                }
++            }
++        } else {
++            auto q6b = [&](int g) { return W.down + ((size_t) ulist[g / D] * D + g % D + ri) * Q6K_ROW + sb * 210; };
++            for (int g0 = r0 + 4 * warp; g0 < r1; g0 += 4 * NW) {
++                const uint8_t * bq = q6b(g0);
++                const q6_ld L = load_q6k(bq, q);
++                const int u = g0 / D, r = g0 % D + ri;
++                w66 w;
++                prep_q6k(L, bq, q, w);
++                const int base = sb * 256 + 64 * q;
++                const __half * a16 = act16 + (u - ulo) * TM * AS;
++                for (unsigned m = umaskl[u]; m; m &= m - 1) {
++                    const int t = __ffs(m) - 1;
++                    float a = dot6(w, a16 + t * AS, base);
++                    a += __shfl_xor_sync(0xffffffff, a, 4); a += __shfl_xor_sync(0xffffffff, a, 2); a += __shfl_xor_sync(0xffffffff, a, 1);
++                    if ((lane & 7) == 0) {
++                        const int k = kof[u][t];
++                        P.ypart[((size_t) t * NU + k) * D + r] = selw[t][k] * a;
++                    }
+                 }
+             }
+         }
+@@ -743,9 +854,14 @@ void ggml_cuda_p60_mega_moe_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+     kp.egu    = kp.shgu + n_shgu;
+     kp.shout  = kp.egu + n_egu;
+     kp.ypart  = kp.shout + n_shout;
+-    static const void * const kern[TM] = { (const void *) moe_t_kernel<1>, (const void *) moe_t_kernel<2>, (const void *) moe_t_kernel<3>,
+-                                           (const void *) moe_t_kernel<4>, (const void *) moe_t_kernel<5>, (const void *) moe_t_kernel<6> };
+-    mega_launch(ctx, kern[n_tokens - 1], kp, 3);
++#define P60_MOE_T_KERNELS(GU5, DN6) { (const void *) moe_t_kernel<1, GU5, DN6>, (const void *) moe_t_kernel<2, GU5, DN6>, \
++        (const void *) moe_t_kernel<3, GU5, DN6>, (const void *) moe_t_kernel<4, GU5, DN6>, (const void *) moe_t_kernel<5, GU5, DN6>, \
++        (const void *) moe_t_kernel<6, GU5, DN6> }
++    static const void * const kern[3][TM] = { P60_MOE_T_KERNELS(false, false), P60_MOE_T_KERNELS(false, true), P60_MOE_T_KERNELS(true, true) };
++#undef P60_MOE_T_KERNELS
++    const bool gu5 = args.gate_type == GGML_TYPE_Q5_K, dn6 = args.down_type == GGML_TYPE_Q6_K;
++    GGML_ASSERT((args.gate_type == GGML_TYPE_Q4_K || gu5) && (args.down_type == GGML_TYPE_Q5_K || dn6) && (!gu5 || dn6));
++    mega_launch(ctx, kern[gu5 ? 2 : dn6 ? 1 : 0][n_tokens - 1], kp, 3);
+ }
+ 
+ void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args, int n_tokens, int n_snap,
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+index ab4b3b609..31ec69ffd 100644
+--- a/ggml/src/ggml-cuda/p60-mega.cuh
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -50,6 +50,8 @@ struct ggml_cuda_p60_mega_moe_args {
+     const char *  sg;     // Q8_0 [512 rows of 2048]
+     const char *  su;     // Q8_0
+     const char *  sd;     // Q8_0 [2048 rows of 512]
++    int           gate_type; // ggml_type of gate / up: Q4_K (Q5_K in some layers, multi-token kernel only)
++    int           down_type; // Q5_K (Q6_K in some layers, multi-token kernel only)
+ };
+ 
+ void ggml_cuda_p60_mega_gdn(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args);
+-- 
+2.56.0
+

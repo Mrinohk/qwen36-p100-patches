@@ -1,0 +1,1104 @@
+From 1122ec768f604e08fefcab470d2ed11e56539320 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 23:24:53 -0400
+Subject: [PATCH 18/31] cuda : persistent single-token layer-half kernels for
+ Qwen3.5/3.6 MoE on sm_60
+
+GGML_CUDA_P60_MEGA=1 (with GGML_CUDA_P60_MMVQ=1) runs each half of a gated-delta-net layer as one cooperative
+launch at decode (one token, one sequence, no recurrent snapshots):
+- GDN half: attn_norm, qkv (+ conv, silu, conv-state update), z, alpha, beta, recurrence (+ state update),
+  gated norm, ssm_out, residual add. 3 phases.
+- MoE half: post-attention norm, router top-8 + shared gate, expert gate/up + shared gate/up/down, expert down,
+  weighted sum, residual add. 3 phases.
+All blocks stay resident and sync with a software grid barrier between phases (counter grows across launches).
+The matchers find a half by op and weight name from its RMS_NORM to its residual ADD and fall back to the
+normal path on anything else (attention layers, snapshot state for MTP, other quant types, extra get_rows).
+An ADD before such a norm is no longer fused into it. GGML_CUDA_P60_MEGA_DEBUG=1 logs why a match failed.
+
+Not bit-exact: fp32 activations, no int8/fp16 activation rounding. 2x P100, 35B UD-Q4_K_XL, no speculation:
+llama-bench tg128 85.6 -> 116.7 t/s; server 8-prompt bench 84.0 -> 113.6 t/s (greedy), 113.5 (prod sampler).
+wikitext-2 ub=1 vs stock base: KLD 0.0044, PPL +0.25% +- 0.18%, same top 97.2% (production path: 0.0040,
+97.8%). In a harness on real weights the MoE output error vs fp64 is ~1e-14 here vs ~1e-4 for int8 activations.
+MTP decoding is unchanged (verify is multi-token).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/common.cuh   |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu | 362 +++++++++++++++++++-
+ ggml/src/ggml-cuda/p60-mega.cu  | 584 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/p60-mega.cuh |  56 +++
+ 4 files changed, 1005 insertions(+), 1 deletion(-)
+ create mode 100644 ggml/src/ggml-cuda/p60-mega.cu
+ create mode 100644 ggml/src/ggml-cuda/p60-mega.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 07f59f021..203ae2913 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1527,6 +1527,10 @@ struct ggml_backend_cuda_context {
+     p60_gdn_state_src p60_gdn_state[p60_gdn_state_n];
+     int               p60_gdn_state_count = 0;
+ 
++    // persistent single-token layer kernels (p60-mega.cu): grid barrier counter, next barrier target base
++    unsigned * p60_mega_bar   = nullptr;
++    unsigned   p60_mega_epoch = 0;
++
+     static constexpr int p60_x_cache_n = 4;
+     p60_x_cache_entry p60_x_cache[p60_x_cache_n];
+     int               p60_x_cache_next = 0;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e5bea52d5..9e1f2c730 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -33,6 +33,7 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/mmvq-p60.cuh"
++#include "ggml-cuda/p60-mega.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -705,6 +706,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+     q8_1_cache_free();
+ 
++    if (p60_mega_bar != nullptr) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaFree(p60_mega_bar));
++    }
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -3708,6 +3714,336 @@ static bool ggml_cuda_p60_conv_state_plan(ggml_backend_cuda_context * ctx, const
+     return false;
+ }
+ 
++// ---- persistent single-token layer halves (p60-mega.cu), GGML_CUDA_P60_MEGA=1 ----
++// A half of a Qwen3.5/3.6 MoE layer starts at the RMS_NORM of its input and ends at the residual ADD. The matchers
++// identify every node in that range by op and weight name and fail on anything else, so other graphs (snapshot
++// state, other quant types, extra get_rows on the last layer, ...) keep the normal path.
++
++static bool p60_is_weight(const ggml_tensor * t, int il, const char * suffix) {
++    char buf[128];
++    snprintf(buf, sizeof(buf), "blk.%d.%s", il, suffix);
++    return t != nullptr && strcmp(t->name, buf) == 0;
++}
++
++static bool p60_is_node(const ggml_tensor * t, const char * base, int il) {
++    char buf[128];
++    snprintf(buf, sizeof(buf), "%s-%d", base, il);
++    return t != nullptr && strcmp(t->name, buf) == 0;
++}
++
++static const ggml_tensor * p60_view_root(const ggml_tensor * t) {
++    while (t->view_src != nullptr) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++// the tensors computed in nodes [beg, end] are not graph outputs and not read by the next nodes, except keep
++static bool p60_range_private(const ggml_cgraph * g, int beg, int end, const ggml_tensor * keep) {
++    for (int k = beg; k <= end; k++) {
++        const ggml_tensor * t = g->nodes[k];
++        if (t != keep && (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return false;
++        }
++    }
++    const int lim = std::min(g->n_nodes, end + 400);
++    for (int k = end + 1; k < lim; k++) {
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            const ggml_tensor * src = g->nodes[k]->src[j];
++            if (src == nullptr) {
++                continue;
++            }
++            const ggml_tensor * r = p60_view_root(src);
++            if (r == keep || p60_view_root(keep) == r) {
++                continue;
++            }
++            for (int m = beg; m <= end; m++) {
++                if (g->nodes[m] == r || g->nodes[m] == src) {
++                    return false;
++                }
++            }
++        }
++    }
++    return true;
++}
++
++static bool p60_f32_vec(const ggml_tensor * t, int64_t n) {
++    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_nelements(t) == n && ggml_is_contiguous(t);
++}
++
++static bool p60_mat(const ggml_tensor * t, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2 = 1) {
++    return t != nullptr && t->type == type && t->ne[0] == ne0 && t->ne[1] == ne1 && t->ne[2] == ne2 && t->ne[3] == 1 &&
++        ggml_is_contiguous(t) && ((uintptr_t) t->data) % 16 == 0;
++}
++
++// GGML_CUDA_P60_MEGA_DEBUG=1: log why a match attempt failed (first 40 failures)
++static int p60_mega_fail(int line, const ggml_tensor * t, const ggml_tensor * at = nullptr) {
++    static const bool dbg = getenv("GGML_CUDA_P60_MEGA_DEBUG") != nullptr;
++    static std::map<int, int> n;
++    if (dbg && t->ne[1] == 1 && n[line]++ < 12) {
++        fprintf(stderr, "p60-mega: no match at line %d (%s %s) at %s %s src0 %s src1 %s\n", line, ggml_op_desc(t), t->name,
++            at ? ggml_op_desc(at) : "-", at ? at->name : "-", at && at->src[0] ? at->src[0]->name : "-", at && at->src[1] ? at->src[1]->name : "-");
++    }
++    return 0;
++}
++#define P60_MEGA_FAIL return p60_mega_fail(__LINE__, g->nodes[i], cur_t)
++
++static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, int i, bool dry = false) {
++    const ggml_tensor * norm = g->nodes[i];
++    const ggml_tensor * cur_t = nullptr;
++    if (i + 2 >= g->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * nmul = g->nodes[i + 1];
++    if (nmul->op != GGML_OP_MUL || nmul->src[0] != norm || nmul->src[1] == nullptr) {
++        return 0;
++    }
++    int il = -1;
++    if (sscanf(nmul->src[1]->name, "blk.%d.attn_norm.weight", &il) != 1 || !p60_is_weight(nmul->src[1], il, "attn_norm.weight")) {
++        return 0;
++    }
++    int e = -1;
++    for (int k = i + 2; k < g->n_nodes && k < i + 120; k++) {
++        if (g->nodes[k]->op == GGML_OP_ADD && p60_is_node(g->nodes[k], "attn_residual", il)) {
++            e = k;
++            break;
++        }
++    }
++    if (e < 0) {
++        P60_MEGA_FAIL;
++    }
++    ggml_cuda_p60_mega_gdn_args a = {};
++    const ggml_tensor * qkv = nullptr, * z = nullptr, * out = nullptr, * alpha = nullptr, * beta = nullptr;
++    const ggml_tensor * dt = nullptr, * ssa = nullptr, * conv = nullptr, * snorm = nullptr, * cs_get = nullptr, * ss_get = nullptr;
++    const ggml_tensor * cs_cpy = nullptr, * ss_cpy = nullptr, * gdn = nullptr;
++    float eps_l2 = -1.0f, scale_l2 = -1.0f, eps_gn = -1.0f;
++    ggml_tensor * prerun[8];
++    int n_prerun = 0;
++    for (int k = i + 2; k < e; k++) {
++        ggml_tensor * t = g->nodes[k];
++        cur_t = t;
++        switch (t->op) {
++            case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_TRANSPOSE: case GGML_OP_PERMUTE: case GGML_OP_NONE:
++            case GGML_OP_CONCAT:
++                break;
++            case GGML_OP_MUL_MAT:
++                if      (p60_is_weight(t->src[0], il, "attn_qkv.weight"))  { qkv   = t->src[0]; if (t->src[1] != nmul) P60_MEGA_FAIL; }
++                else if (p60_is_weight(t->src[0], il, "attn_gate.weight")) { z     = t->src[0]; if (t->src[1] != nmul) P60_MEGA_FAIL; }
++                else if (p60_is_weight(t->src[0], il, "ssm_alpha.weight")) { alpha = t->src[0]; if (t->src[1] != nmul) P60_MEGA_FAIL; }
++                else if (p60_is_weight(t->src[0], il, "ssm_beta.weight"))  { beta  = t->src[0]; if (t->src[1] != nmul) P60_MEGA_FAIL; }
++                else if (p60_is_weight(t->src[0], il, "ssm_out.weight"))   { out   = t->src[0]; }
++                else P60_MEGA_FAIL;
++                break;
++            case GGML_OP_GET_ROWS:
++                if (ggml_nelements(t) == 0) {
++                    break;
++                }
++                if (p60_is_node(t, "conv_states", il)) {
++                    cs_get = t;
++                } else if (t->src[0]->ne[0] == 128*128*32) {
++                    ss_get = t;
++                } else {
++                    P60_MEGA_FAIL;
++                }
++                break;
++            case GGML_OP_CPY:
++                if (ggml_nelements(t) == 0) {
++                    break;
++                }
++                if (p60_is_node(t->src[0], "conv_state_last", il)) {
++                    cs_cpy = t;
++                } else if (p60_is_node(t->src[0], "new_state", il)) {
++                    ss_cpy = t;
++                } else {
++                    P60_MEGA_FAIL;
++                }
++                break;
++            case GGML_OP_SCALE: {
++                float sc, bias;
++                memcpy(&sc, (const float *) t->op_params + 0, sizeof(float));
++                memcpy(&bias, (const float *) t->op_params + 1, sizeof(float));
++                if (t->src[0]->op == GGML_OP_RMS_NORM) {
++                    if (bias != 0.0f || (scale_l2 >= 0.0f && scale_l2 != sc)) P60_MEGA_FAIL;
++                    scale_l2 = sc;
++                } else if (t->view_src != nullptr && n_prerun < 8) {
++                    if (ggml_nelements(t) > 0) {
++                        prerun[n_prerun++] = t; // in-place clear of a cache row: run it as is, before the kernel
++                    }
++                } else {
++                    P60_MEGA_FAIL;
++                }
++                break;
++            }
++            case GGML_OP_RMS_NORM: {
++                float eps;
++                memcpy(&eps, t->op_params, sizeof(float));
++                if (p60_is_node(t->src[0], "q_conv", il) || p60_is_node(t->src[0], "k_conv", il)) {
++                    if (eps_l2 >= 0.0f && eps_l2 != eps) P60_MEGA_FAIL;
++                    eps_l2 = eps;
++                } else if (p60_is_node(t->src[0], "attn_output", il)) {
++                    eps_gn = eps;
++                } else {
++                    P60_MEGA_FAIL;
++                }
++                break;
++            }
++            case GGML_OP_SSM_CONV:
++                conv = t->src[1];
++                break;
++            case GGML_OP_UNARY: {
++                const ggml_unary_op u = ggml_get_unary_op(t);
++                if (u != GGML_UNARY_OP_SILU && u != GGML_UNARY_OP_SOFTPLUS && u != GGML_UNARY_OP_SIGMOID) P60_MEGA_FAIL;
++                break;
++            }
++            case GGML_OP_ADD:
++                if (!p60_is_weight(t->src[1], il, "ssm_dt.bias")) P60_MEGA_FAIL;
++                dt = t->src[1];
++                break;
++            case GGML_OP_MUL:
++                if      (p60_is_weight(t->src[1], il, "ssm_a"))            ssa   = t->src[1];
++                else if (p60_is_weight(t->src[1], il, "ssm_norm.weight"))  snorm = t->src[1];
++                else if (t->src[1]->op != GGML_OP_UNARY)                   P60_MEGA_FAIL; // gated norm: norm * silu(z)
++                break;
++            case GGML_OP_GATED_DELTA_NET:
++                gdn = t;
++                break;
++            default:
++                P60_MEGA_FAIL;
++        }
++    }
++    const ggml_tensor * add = g->nodes[e];
++    if (!qkv || !z || !out || !alpha || !beta || !dt || !ssa || !conv || !snorm || !cs_get || !ss_get || !cs_cpy || !ss_cpy || !gdn ||
++            eps_l2 < 0.0f || scale_l2 < 0.0f || eps_gn < 0.0f || add->src[1] != norm->src[0]) {
++        P60_MEGA_FAIL;
++    }
++    // single token, single sequence, no state snapshots (output = attention values + one state)
++    if (gdn->src[0]->ne[2] != 1 || gdn->src[0]->ne[3] != 1 || gdn->ne[0] != 4096 || gdn->ne[1] != 128 + 1 ||
++            !p60_mat(qkv, GGML_TYPE_Q8_0, 2048, 8192) || !p60_mat(z, GGML_TYPE_Q8_0, 2048, 4096) || !p60_mat(out, GGML_TYPE_Q8_0, 4096, 2048) ||
++            !p60_mat(alpha, GGML_TYPE_F32, 2048, 32) || !p60_mat(beta, GGML_TYPE_F32, 2048, 32) || !p60_mat(conv, GGML_TYPE_F32, 4, 8192) ||
++            !p60_f32_vec(dt, 32) || !p60_f32_vec(ssa, 32) || !p60_f32_vec(snorm, 128) || !p60_f32_vec(nmul->src[1], 2048) ||
++            !p60_f32_vec(norm->src[0], 2048) || !p60_f32_vec(add, 2048) ||
++            cs_get->src[0]->nb[1] != 3*8192*sizeof(float) || ss_get->src[0]->nb[1] != 128*128*32*sizeof(float) ||
++            cs_get->src[1]->type != GGML_TYPE_I32 || ss_get->src[1]->type != GGML_TYPE_I32 ||
++            ggml_nelements(cs_cpy) != 3*8192 || ggml_nelements(ss_cpy) != 128*128*32 || !ggml_is_contiguous(cs_cpy) || !ggml_is_contiguous(ss_cpy) ||
++            !p60_range_private(g, i, e, add)) {
++        P60_MEGA_FAIL;
++    }
++    if (dry) {
++        return e - i;
++    }
++    memcpy(&a.eps_norm, norm->op_params, sizeof(float));
++    a.x_in = (const float *) norm->src[0]->data;  a.x_out = (float *) add->data;
++    a.attn_norm = (const float *) nmul->src[1]->data;
++    a.qkv = (const char *) qkv->data; a.z = (const char *) z->data; a.out = (const char *) out->data;
++    a.alpha = (const float *) alpha->data; a.beta = (const float *) beta->data;
++    a.dt = (const float *) dt->data; a.a = (const float *) ssa->data; a.conv = (const float *) conv->data; a.snorm = (const float *) snorm->data;
++    a.eps_l2 = eps_l2; a.scale_l2 = scale_l2; a.eps_gn = eps_gn;
++    a.cs_base = (const float *) cs_get->src[0]->data; a.cs_ids = (const int32_t *) cs_get->src[1]->data; a.cs_row = cs_get->src[0]->nb[1] / sizeof(float);
++    a.cs_out = (float *) cs_cpy->data;
++    a.ss_base = (const float *) ss_get->src[0]->data; a.ss_ids = (const int32_t *) ss_get->src[1]->data; a.ss_row = ss_get->src[0]->nb[1] / sizeof(float);
++    a.ss_out = (float *) ss_cpy->data;
++    for (int k = 0; k < n_prerun; k++) {
++        ggml_cuda_compute_forward(*ctx, prerun[k]);
++    }
++    ggml_cuda_p60_mega_gdn(*ctx, a);
++    return e - i;
++}
++
++static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, int i, bool dry = false) {
++    const ggml_tensor * norm = g->nodes[i];
++    const ggml_tensor * cur_t = nullptr;
++    if (i + 2 >= g->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * nmul = g->nodes[i + 1];
++    if (nmul->op != GGML_OP_MUL || nmul->src[0] != norm || nmul->src[1] == nullptr) {
++        return 0;
++    }
++    int il = -1;
++    if (sscanf(nmul->src[1]->name, "blk.%d.post_attention_norm.weight", &il) != 1 || !p60_is_weight(nmul->src[1], il, "post_attention_norm.weight")) {
++        return 0;
++    }
++    int e = -1;
++    for (int k = i + 2; k < g->n_nodes && k < i + 100; k++) {
++        const ggml_tensor * t = g->nodes[k];
++        if (t->op == GGML_OP_ADD && t->src[1] == norm->src[0] && p60_is_node(t, "l_out", il)) {
++            e = k;
++            break;
++        }
++    }
++    if (e < 0) {
++        P60_MEGA_FAIL;
++    }
++    const ggml_tensor * router = nullptr, * sgate = nullptr, * gate = nullptr, * up = nullptr, * down = nullptr;
++    const ggml_tensor * sg = nullptr, * su = nullptr, * sd = nullptr, * ids = nullptr;
++    int n_softmax = 0, n_div = 0;
++    for (int k = i + 2; k < e; k++) {
++        const ggml_tensor * t = g->nodes[k];
++        cur_t = t;
++        switch (t->op) {
++            case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_TRANSPOSE: case GGML_OP_PERMUTE: case GGML_OP_NONE:
++            case GGML_OP_ARGSORT: case GGML_OP_GET_ROWS: case GGML_OP_SUM_ROWS: case GGML_OP_CLAMP: case GGML_OP_GLU:
++            case GGML_OP_ADD: case GGML_OP_MUL:
++                break;
++            case GGML_OP_DIV:
++                n_div++;
++                break;
++            case GGML_OP_SOFT_MAX: {
++                float scale, max_bias;
++                memcpy(&scale, (const float *) t->op_params + 0, sizeof(float));
++                memcpy(&max_bias, (const float *) t->op_params + 1, sizeof(float));
++                if (t->src[1] != nullptr || scale != 1.0f || max_bias != 0.0f) P60_MEGA_FAIL;
++                n_softmax++;
++                break;
++            }
++            case GGML_OP_UNARY:
++                if (ggml_get_unary_op(t) != GGML_UNARY_OP_SIGMOID) P60_MEGA_FAIL;
++                break;
++            case GGML_OP_MUL_MAT:
++                if      (p60_is_weight(t->src[0], il, "ffn_gate_inp.weight"))       router = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_gate_inp_shexp.weight")) sgate  = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_gate_shexp.weight"))     sg     = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_up_shexp.weight"))       su     = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_down_shexp.weight"))     sd     = t->src[0];
++                else P60_MEGA_FAIL;
++                break;
++            case GGML_OP_MUL_MAT_ID:
++                if      (p60_is_weight(t->src[0], il, "ffn_gate_exps.weight")) gate = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_up_exps.weight"))   up   = t->src[0];
++                else if (p60_is_weight(t->src[0], il, "ffn_down_exps.weight")) down = t->src[0];
++                else P60_MEGA_FAIL;
++                ids = t->src[2];
++                if (t->src[1]->ne[2] != 1) P60_MEGA_FAIL; // one token
++                break;
++            default:
++                P60_MEGA_FAIL;
++        }
++    }
++    const ggml_tensor * add = g->nodes[e];
++    if (!router || !sgate || !gate || !up || !down || !sg || !su || !sd || !ids || n_softmax != 1 || n_div != 1 ||
++            ids->ne[0] != 8 || ids->ne[1] != 1 ||
++            !p60_mat(router, GGML_TYPE_F32, 2048, 256) || !p60_f32_vec(sgate, 2048) ||
++            !p60_mat(gate, GGML_TYPE_Q4_K, 2048, 512, 256) || !p60_mat(up, GGML_TYPE_Q4_K, 2048, 512, 256) ||
++            !p60_mat(down, GGML_TYPE_Q5_K, 512, 2048, 256) ||
++            !p60_mat(sg, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(su, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(sd, GGML_TYPE_Q8_0, 512, 2048) ||
++            !p60_f32_vec(nmul->src[1], 2048) || !p60_f32_vec(norm->src[0], 2048) || !p60_f32_vec(add, 2048) ||
++            !p60_range_private(g, i, e, add)) {
++        P60_MEGA_FAIL;
++    }
++    if (dry) {
++        return e - i;
++    }
++    ggml_cuda_p60_mega_moe_args a = {};
++    a.x_in = (const float *) norm->src[0]->data; a.x_out = (float *) add->data;
++    a.norm = (const float *) nmul->src[1]->data;
++    memcpy(&a.eps, norm->op_params, sizeof(float));
++    a.router = (const float *) router->data; a.sgate = (const float *) sgate->data;
++    a.gate = (const char *) gate->data; a.up = (const char *) up->data; a.down = (const char *) down->data;
++    a.sg = (const char *) sg->data; a.su = (const char *) su->data; a.sd = (const char *) sd->data;
++    ggml_cuda_p60_mega_moe(*ctx, a);
++    return e - i;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -3717,6 +4053,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // whole single-token layer halves as one persistent kernel each (p60-mega.cu)
++    if (node->op == GGML_OP_RMS_NORM) {
++        static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++            getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0;
++        if (enabled && ggml_cuda_info().devices[cuda_ctx->device].cc == 600) {
++            int n = p60_try_mega_gdn(cuda_ctx, cgraph, i);
++            if (n == 0) {
++                n = p60_try_mega_moe(cuda_ctx, cgraph, i);
++            }
++            if (n > 0) {
++                return n;
++            }
++        }
++    }
++
+     // conv-state shuffle folded into the ssm_conv (see ggml_cuda_p60_conv_state_plan): skip the gather, the concat and the
+     // update copies, run the conv with all of it
+     {
+@@ -3752,7 +4103,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
+-    // residual add(s) folded into the RMS norm that follows (mmvq-p60, sm_60)
++    // residual add(s) folded into the RMS norm that follows (mmvq-p60, sm_60); not when that norm starts a layer half
++    // that the persistent kernels take (the add then runs on its own)
++    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM) {
++        static const bool mega = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++            getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0;
++        if (mega && ggml_cuda_info().devices[cuda_ctx->device].cc == 600 &&
++                (p60_try_mega_gdn(cuda_ctx, cgraph, i + 1, true) > 0 || p60_try_mega_moe(cuda_ctx, cgraph, i + 1, true) > 0)) {
++            return 0;
++        }
++    }
+     if (node->op == GGML_OP_ADD) {
+         // the allocator often puts an add in place; ggml_cuda_p60_add_rms_norm_mul allows exact aliasing only
+         if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1, i + 3 }) &&
+diff --git a/ggml/src/ggml-cuda/p60-mega.cu b/ggml/src/ggml-cuda/p60-mega.cu
+new file mode 100644
+index 000000000..e38fbe2ee
+--- /dev/null
++++ b/ggml/src/ggml-cuda/p60-mega.cu
+@@ -0,0 +1,584 @@
++#include "p60-mega.cuh"
++
++// Persistent single-token kernels for the Qwen3.5/3.6 MoE layer halves on sm_60, see p60-mega.cuh.
++// One block of 512 threads per SM. Phases are separated by a software grid barrier on a counter that keeps growing
++// across launches (wrap-safe compare). fp32 math throughout; k-quant and q8_0 weights are dequantized in registers.
++
++namespace {
++
++constexpr int NT = 512, NW = NT / 32;
++constexpr int D = 2048;
++// gated delta net
++constexpr int HK = 16, HV = 32, SD = 128, QKV = 2 * HK * SD + HV * SD, VD = HV * SD;
++constexpr int Q8_ROW_D = D / 32 * 34, Q8_ROW_V = VD / 32 * 34, CHUNK = 1088; // 32 q8_0 blocks
++// MoE
++constexpr int NE = 256, NU = 8, FF = 512;
++constexpr int Q4K_ROW = D / 256 * 144, Q5K_ROW = FF / 256 * 176, Q8_ROW_F = FF / 32 * 34;
++
++// ---------------- common device helpers ----------------
++
++__device__ __forceinline__ void grid_sync(unsigned * bar, unsigned & target) {
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        target += gridDim.x;
++        __threadfence();
++        atomicAdd(bar, 1u);
++        while ((int) (*(volatile unsigned *) bar - target) < 0) {}
++        __threadfence();
++    }
++    __syncthreads();
++}
++
++__device__ __forceinline__ float wsum(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        v += __shfl_xor_sync(0xffffffff, v, o);
++    }
++    return v;
++}
++
++// padded smem index for float4 reads at strides of 64 floats
++__device__ __forceinline__ int px(int k) { return k + 4 * (k >> 6); }
++// padded smem index for scalar reads at strides of 32 floats (one q8_0 block per lane)
++__device__ __forceinline__ int py(int k) { return k + (k >> 5); }
++
++// 4 bytes of u to floats without I2F (quarter rate on sm_60): 0x4B0000bb = 2^23 + bb
++__device__ __forceinline__ float4 bytes_f(unsigned u, float bias) {
++    return make_float4(__int_as_float(__byte_perm(u, 0x4B000000, 0x7540)) - bias, __int_as_float(__byte_perm(u, 0x4B000000, 0x7541)) - bias,
++                       __int_as_float(__byte_perm(u, 0x4B000000, 0x7542)) - bias, __int_as_float(__byte_perm(u, 0x4B000000, 0x7543)) - bias);
++}
++__device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
++__device__ __forceinline__ float silu_f(float v) { return v / (1.f + __expf(-v)); }
++
++__device__ __forceinline__ void stage_row(uint8_t * dst, const char * src, int bytes, int lane) {
++    for (int i = lane; i < bytes / 16; i += 32) {
++        ((int4 *) dst)[i] = __ldg((const int4 *) src + i);
++    }
++    __syncwarp();
++}
++
++// one q8_0 block (34 B, 2 B aligned in smem) against x[32 * xblk ...] in py (PYL) or px layout
++template <bool PYL>
++__device__ __forceinline__ float dot_q8_staged(const uint8_t * stage, int blk, int xblk, const float * xs) {
++    const uint8_t * b = stage + 34 * blk;
++    const float d = __half2float(*(const half *) b);
++    const unsigned short * q = (const unsigned short *) (b + 2);
++    float a = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const unsigned v = (q[2 * i] | ((unsigned) q[2 * i + 1] << 16)) ^ 0x80808080;
++        const int k = 32 * xblk + 4 * i;
++        const float4 xv = PYL ? make_float4(xs[py(k)], xs[py(k + 1)], xs[py(k + 2)], xs[py(k + 3)])
++                              : make_float4(xs[px(k)], xs[px(k + 1)], xs[px(k + 2)], xs[px(k + 3)]);
++        a += dot4(bytes_f(v, 8388608.f + 128.f), xv);
++    }
++    return d * a;
++}
++
++// q8_0 rows as a stream of 1088 B chunks per warp (items u0, u0 + nwg, ... < uend; NCH chunks each). The next two
++// chunks stay in registers while the current one is computed from smem. pre(u) runs when an item starts so that its
++// epilogue loads are in flight during the math; done(u, sum, pre_result) runs when it ends.
++template <int NCH, bool PYL, typename RowFn, typename PreFn, typename DoneFn>
++__device__ __forceinline__ void q8_stream(int u0, int uend, int nwg, int lane, uint8_t * stage, const float * xv, RowFn rowp, PreFn pre, DoneFn done) {
++    const int nitems = u0 < uend ? (uend - u0 + nwg - 1) / nwg : 0;
++    const int nt = nitems * NCH;
++    int4 b0[3], b1[3];
++    auto ld = [&](int t, int4 * bb) {
++        const int4 * p = (const int4 *) (rowp(u0 + (t / NCH) * nwg) + (t % NCH) * CHUNK);
++        bb[0] = __ldg(p + lane);
++        bb[1] = __ldg(p + 32 + lane);
++        if (lane < 4) {
++            bb[2] = __ldg(p + 64 + lane);
++        }
++    };
++    if (nt > 0) ld(0, b0);
++    if (nt > 1) ld(1, b1);
++    float a = 0.f;
++    decltype(pre(0)) pv = {};
++    for (int t = 0; t < nt; t++) {
++        if (t % NCH == 0) {
++            pv = pre(u0 + (t / NCH) * nwg);
++        }
++        int4 * s = (int4 *) stage;
++        s[lane] = b0[0];
++        s[32 + lane] = b0[1];
++        if (lane < 4) {
++            s[64 + lane] = b0[2];
++        }
++        __syncwarp();
++        b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++        if (t + 2 < nt) {
++            ld(t + 2, b1);
++        }
++        a += dot_q8_staged<PYL>(stage, lane, 32 * (t % NCH) + lane, xv);
++        __syncwarp();
++        if (t % NCH == NCH - 1) {
++            a = wsum(a);
++            done(u0 + (t / NCH) * nwg, a, pv);
++            a = 0.f;
++        }
++    }
++}
++
++// xs = rms_norm(x) * w for one 2048 vector, per block, px or py layout
++template <bool PYL>
++__device__ __forceinline__ void block_rms_norm(const float * x, const float * w, float eps, float * xs, float * red, float * scal) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    float xv[D / NT], ss = 0.f;
++#pragma unroll
++    for (int j = 0; j < D / NT; j++) {
++        xv[j] = x[threadIdx.x + j * NT];
++        ss += xv[j] * xv[j];
++    }
++    ss = wsum(ss);
++    if (lane == 0) {
++        red[warp] = ss;
++    }
++    __syncthreads();
++    if (warp == 0) {
++        float v = lane < NW ? red[lane] : 0.f;
++        v = wsum(v);
++        if (lane == 0) {
++            scal[0] = rsqrtf(v / D + eps);
++        }
++    }
++    __syncthreads();
++#pragma unroll
++    for (int j = 0; j < D / NT; j++) {
++        const int k = threadIdx.x + j * NT;
++        xs[PYL ? py(k) : px(k)] = xv[j] * scal[0] * __ldg(w + k);
++    }
++    __syncthreads();
++}
++
++// ---------------- k-quant helpers ----------------
++
++// 6-bit scale/min j (0..7) from the 12 scale bytes in words s0, s1, s2 (no dynamic register indexing)
++__device__ __forceinline__ void scale_min_k4(int j, unsigned s0, unsigned s1, unsigned s2, int & d, int & m) {
++    const int sh = 8 * (j & 3);
++    const int b0 = (s0 >> sh) & 0xFF, b1 = (s1 >> sh) & 0xFF, b2 = (s2 >> sh) & 0xFF;
++    if (j < 4) {
++        d = b0 & 63; m = b1 & 63;
++    } else {
++        d = (b2 & 0xF) | ((b0 >> 6) << 4); m = (b2 >> 4) | ((b1 >> 6) << 4);
++    }
++}
++
++struct q4_ld { int4 h, qa, qb; };
++// q4_K row of K = 2048, one warp: lane = superblock * 4 + 64-weight chunk
++__device__ __forceinline__ q4_ld load_q4k(const char * row, int lane) {
++    const char * b = row + (lane >> 2) * 144;
++    const int q = lane & 3;
++    return {__ldg((const int4 *) b), __ldg((const int4 *) (b + 16 + 32 * q)), __ldg((const int4 *) (b + 32 + 32 * q))};
++}
++__device__ __forceinline__ float dot_q4k(const q4_ld & L, const float * xs, int lane) {
++    const int sb = lane >> 2, q = lane & 3;
++    const half2 dm = __halves2half2(__ushort_as_half(L.h.x & 0xFFFF), __ushort_as_half(L.h.x >> 16));
++    int s0, m0, s1, m1;
++    scale_min_k4(2 * q, L.h.y, L.h.z, L.h.w, s0, m0);
++    scale_min_k4(2 * q + 1, L.h.y, L.h.z, L.h.w, s1, m1);
++    const int base = sb * 256 + 64 * q;
++    const unsigned w[8] = {(unsigned) L.qa.x, (unsigned) L.qa.y, (unsigned) L.qa.z, (unsigned) L.qa.w,
++                           (unsigned) L.qb.x, (unsigned) L.qb.y, (unsigned) L.qb.z, (unsigned) L.qb.w};
++    float a0 = 0.f, a1 = 0.f, x0 = 0.f, x1 = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const float4 lo = *(const float4 *) &xs[px(base + 4 * i)];
++        const float4 hi = *(const float4 *) &xs[px(base + 32 + 4 * i)];
++        a0 += dot4(bytes_f(w[i] & 0x0F0F0F0F, 8388608.f), lo);
++        a1 += dot4(bytes_f((w[i] >> 4) & 0x0F0F0F0F, 8388608.f), hi);
++        x0 += lo.x + lo.y + lo.z + lo.w;
++        x1 += hi.x + hi.y + hi.z + hi.w;
++    }
++    return __low2float(dm) * (s0 * a0 + s1 * a1) - __high2float(dm) * (m0 * x0 + m1 * x1);
++}
++
++// q5_K superblock, 64-weight chunk q against act (px layout), base = element index of the chunk
++__device__ __forceinline__ float dot_q5k(const char * b, int q, const float * act, int base) {
++    const int4 h  = __ldg((const int4 *) b);
++    const int4 ha = __ldg((const int4 *) (b + 16));
++    const int4 hb = __ldg((const int4 *) (b + 32));
++    const int4 qa = __ldg((const int4 *) (b + 48 + 32 * q));
++    const int4 qb = __ldg((const int4 *) (b + 64 + 32 * q));
++    const half2 dm = __halves2half2(__ushort_as_half(h.x & 0xFFFF), __ushort_as_half(h.x >> 16));
++    int s0, m0, s1, m1;
++    scale_min_k4(2 * q, h.y, h.z, h.w, s0, m0);
++    scale_min_k4(2 * q + 1, h.y, h.z, h.w, s1, m1);
++    const unsigned w[8]  = {(unsigned) qa.x, (unsigned) qa.y, (unsigned) qa.z, (unsigned) qa.w, (unsigned) qb.x, (unsigned) qb.y, (unsigned) qb.z, (unsigned) qb.w};
++    const unsigned hh[8] = {(unsigned) ha.x, (unsigned) ha.y, (unsigned) ha.z, (unsigned) ha.w, (unsigned) hb.x, (unsigned) hb.y, (unsigned) hb.z, (unsigned) hb.w};
++    const unsigned bl = 2 * q, bh = 2 * q + 1;
++    float a0 = 0.f, a1 = 0.f, x0 = 0.f, x1 = 0.f;
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const float4 lo = *(const float4 *) &act[px(base + 4 * i)];
++        const float4 hi = *(const float4 *) &act[px(base + 32 + 4 * i)];
++        a0 += dot4(bytes_f((w[i] & 0x0F0F0F0F) | (((hh[i] >> bl) & 0x01010101) << 4), 8388608.f), lo);
++        a1 += dot4(bytes_f(((w[i] >> 4) & 0x0F0F0F0F) | (((hh[i] >> bh) & 0x01010101) << 4), 8388608.f), hi);
++        x0 += lo.x + lo.y + lo.z + lo.w;
++        x1 += hi.x + hi.y + hi.z + hi.w;
++    }
++    return __low2float(dm) * (s0 * a0 + s1 * a1) - __high2float(dm) * (m0 * x0 + m1 * x1);
++}
++
++// ---------------- gated delta net half ----------------
++
++struct gdn_params {
++    ggml_cuda_p60_mega_gdn_args a;
++    float * qkvc; // [QKV] conv + silu output
++    float * zv;   // [VD]
++    float * gb;   // [2][HV] log decay | beta
++    float * o;    // [VD] recurrence output
++    unsigned * bar;
++    unsigned base;
++};
++
++struct conv_pre { float4 w; float s0, s1, s2; };
++
++__global__ void __launch_bounds__(NT, 1) p60_mega_gdn_kernel(const gdn_params P) {
++    __shared__ __align__(16) float xs[D + D / 32];   // normed x, py layout
++    __shared__ __align__(16) float on[VD + VD / 32]; // gated-normed recurrence output, py layout
++    __shared__ __align__(16) uint8_t stage[NW][CHUNK];
++    __shared__ float red[NW], scal[1];
++    const ggml_cuda_p60_mega_gdn_args & A = P.a;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
++    unsigned target = P.base;
++
++    block_rms_norm<true>(A.x_in, A.attn_norm, A.eps_norm, xs, red, scal);
++
++    // phase 1: alpha, beta (f32 rows), qkv rows with the causal conv + silu + conv-state update, z rows
++    constexpr int NAB = 2 * HV, N1 = NAB + QKV + VD;
++    if (gw < NAB) {
++        const int h = gw % HV;
++        const float * w = (gw < HV ? A.alpha : A.beta) + (size_t) h * D;
++        float a = 0.f;
++#pragma unroll 4
++        for (int i = 0; i < D / 128; i++) {
++            const int k = 128 * i + 4 * lane;
++            a += dot4(__ldg((const float4 *) (w + 128 * i) + lane), make_float4(xs[py(k)], xs[py(k + 1)], xs[py(k + 2)], xs[py(k + 3)]));
++        }
++        a = wsum(a);
++        if (lane == 0) {
++            if (gw < HV) {
++                const float xb = a + __ldg(A.dt + h);
++                P.gb[h] = (xb > 20.0f ? xb : logf(1.0f + expf(xb))) * __ldg(A.a + h);
++            } else {
++                P.gb[HV + h] = 1.0f / (1.0f + expf(-a));
++            }
++        }
++    }
++    const float * cs_in = A.cs_base + (int64_t) A.cs_ids[0] * A.cs_row;
++    q8_stream<2, true>(gw < NAB ? gw + nwg : gw, N1, nwg, lane, stage[warp], xs,
++        [&](int u) { const int r = u - NAB; return r < QKV ? A.qkv + (size_t) r * Q8_ROW_D : A.z + (size_t) (r - QKV) * Q8_ROW_D; },
++        [&](int u) {
++            const int r = u - NAB;
++            conv_pre p = {};
++            if (lane == 0 && r < QKV) {
++                p.w  = __ldg((const float4 *) (A.conv + 4 * r));
++                p.s0 = cs_in[3 * r]; p.s1 = cs_in[3 * r + 1]; p.s2 = cs_in[3 * r + 2];
++            }
++            return p;
++        },
++        [&](int u, float a, const conv_pre & p) {
++            const int r = u - NAB;
++            if (lane != 0) {
++                return;
++            }
++            if (r < QKV) {
++                // conv over [s0, s1, s2, x], state <- [s1, s2, x]
++                const float c = p.w.x * p.s0 + p.w.y * p.s1 + p.w.z * p.s2 + p.w.w * a;
++                A.cs_out[3 * r] = p.s1; A.cs_out[3 * r + 1] = p.s2; A.cs_out[3 * r + 2] = a;
++                P.qkvc[r] = silu_f(c);
++            } else {
++                P.zv[r - QKV] = a;
++            }
++        });
++    grid_sync(P.bar, target);
++
++    // phase 2: recurrence, one warp per (v head, state column); lane holds rows i = lane + 32 r
++    const float * ss_in = A.ss_base + (int64_t) A.ss_ids[0] * A.ss_row;
++    for (int u = gw; u < HV * SD; u += nwg) {
++        const int h = u / SD, col = u % SD, kh = h % HK;
++        const size_t off = (size_t) h * SD * SD + (size_t) col * SD;
++        float q[4], k[4], s[4];
++#pragma unroll
++        for (int r = 0; r < 4; r++) {
++            q[r] = __ldcg(P.qkvc + kh * SD + 32 * r + lane);
++            k[r] = __ldcg(P.qkvc + HK * SD + kh * SD + 32 * r + lane);
++            s[r] = ss_in[off + 32 * r + lane];
++        }
++        const float vcol = __ldcg(P.qkvc + 2 * HK * SD + h * SD + col);
++        const float g = expf(__ldcg(P.gb + h)), beta = __ldcg(P.gb + HV + h);
++        const float iq = rsqrtf(wsum(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]) / SD + A.eps_l2) * A.scale_l2;
++        const float ik = rsqrtf(wsum(k[0] * k[0] + k[1] * k[1] + k[2] * k[2] + k[3] * k[3]) / SD + A.eps_l2) * A.scale_l2;
++        float kv = 0.f;
++#pragma unroll
++        for (int r = 0; r < 4; r++) {
++            q[r] *= iq; k[r] *= ik;
++            kv += s[r] * k[r];
++        }
++        kv = wsum(kv);
++        const float delta = (vcol - g * kv) * beta;
++        float at = 0.f;
++#pragma unroll
++        for (int r = 0; r < 4; r++) {
++            s[r] = g * s[r] + k[r] * delta;
++            at += s[r] * q[r];
++            A.ss_out[off + 32 * r + lane] = s[r];
++        }
++        at = wsum(at);
++        if (lane == 0) {
++            P.o[h * SD + col] = at * rsqrtf((float) SD);
++        }
++    }
++    grid_sync(P.bar, target);
++
++    // phase 3: gated norm (per block, 8 elements per thread, 16 threads per head), ssm_out rows + residual
++    {
++        const int e = 8 * threadIdx.x, i0 = e % SD;
++        const float4 o0 = __ldcg((const float4 *) (P.o + e)),  o1 = __ldcg((const float4 *) (P.o + e + 4));
++        const float4 z0 = __ldcg((const float4 *) (P.zv + e)), z1 = __ldcg((const float4 *) (P.zv + e + 4));
++        const float4 n0 = __ldg((const float4 *) (A.snorm + i0)), n1 = __ldg((const float4 *) (A.snorm + i0 + 4));
++        float ssq = dot4(o0, o0) + dot4(o1, o1);
++#pragma unroll
++        for (int m = 8; m > 0; m >>= 1) {
++            ssq += __shfl_xor_sync(0xffffffff, ssq, m);
++        }
++        const float inv = rsqrtf(ssq / SD + A.eps_gn);
++        const float ov[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
++        const float zz[8] = {z0.x, z0.y, z0.z, z0.w, z1.x, z1.y, z1.z, z1.w};
++        const float nn[8] = {n0.x, n0.y, n0.z, n0.w, n1.x, n1.y, n1.z, n1.w};
++#pragma unroll
++        for (int j = 0; j < 8; j++) {
++            on[py(e + j)] = ov[j] * inv * nn[j] * silu_f(zz[j]);
++        }
++    }
++    __syncthreads();
++    q8_stream<4, true>(gw, D, nwg, lane, stage[warp], on,
++        [&](int r) { return A.out + (size_t) r * Q8_ROW_V; },
++        [&](int r) { return lane == 0 ? A.x_in[r] : 0.f; },
++        [&](int r, float a, float x0) { if (lane == 0) A.x_out[r] = x0 + a; });
++}
++
++// ---------------- MoE half ----------------
++
++struct moe_params {
++    ggml_cuda_p60_mega_moe_args a;
++    float * logits; // [NE + 1]: router, shared-expert gate
++    float * shgu;   // [2 * FF]
++    float * egu;    // [NU][2 * FF]
++    float * shout;  // [D]
++    unsigned * bar;
++    unsigned base;
++};
++
++struct moe_res_pre { float x, sh; };
++
++__global__ void __launch_bounds__(NT, 1) p60_mega_moe_kernel(const moe_params P) {
++    __shared__ __align__(16) float xs[D + D / 16];             // normed x, px layout
++    __shared__ __align__(16) float act[NU * FF + NU * FF / 16]; // expert swiglu (px); first FF: shared swiglu
++    __shared__ __align__(16) uint8_t stage[NW][CHUNK];
++    __shared__ float red[NW], scal[2], red_lg[NE], selw[NU];
++    __shared__ unsigned long long red_key[64];
++    __shared__ int sel[NU];
++    const ggml_cuda_p60_mega_moe_args & A = P.a;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
++    unsigned target = P.base;
++
++    block_rms_norm<false>(A.x_in, A.norm, A.eps, xs, red, scal);
++
++    // phase 1: router + shared gate input (f32 rows), shared gate/up (q8_0)
++    if (gw <= NE) {
++        const float * w = gw < NE ? A.router + (size_t) gw * D : A.sgate;
++        float a = 0.f;
++#pragma unroll 4
++        for (int i = 0; i < D / 128; i++) {
++            a += dot4(__ldg((const float4 *) (w + 128 * i) + lane), *(const float4 *) &xs[px(128 * i + 4 * lane)]);
++        }
++        a = wsum(a);
++        if (lane == 0) {
++            P.logits[gw] = a;
++        }
++    }
++    q8_stream<2, false>(gw <= NE ? gw + nwg : gw, NE + 1 + 2 * FF, nwg, lane, stage[warp], xs,
++        [&](int u) { const int r = u - NE - 1; return r < FF ? A.sg + (size_t) r * Q8_ROW_D : A.su + (size_t) (r - FF) * Q8_ROW_D; },
++        [&](int) { return 0; },
++        [&](int u, float a, int) { if (lane == 0) P.shgu[u - NE - 1] = a; });
++    grid_sync(P.bar, target);
++
++    // phase 2 prologue (per block): top-8 of the router (weights renormalized over the top 8, so the softmax
++    // denominator cancels); sort key = order-preserving logit bits, then 255 - index (ties to the lower index).
++    // Each of 8 warps bitonic-sorts its 32 keys and keeps its top 8, then the 64 candidates are ranked.
++    if (threadIdx.x == NE) {
++        scal[1] = 1.f / (1.f + __expf(-__ldcg(P.logits + NE)));
++    }
++    if (threadIdx.x < NE) {
++        const float v = __ldcg(P.logits + threadIdx.x);
++        const unsigned uu = __float_as_uint(v);
++        const unsigned o = uu ^ ((unsigned) ((int) uu >> 31) | 0x80000000u);
++        unsigned long long k = ((unsigned long long) o << 8) | (255 - threadIdx.x);
++        red_lg[threadIdx.x] = v;
++#pragma unroll
++        for (int size = 2; size <= 32; size <<= 1) {
++#pragma unroll
++            for (int stride = size / 2; stride > 0; stride >>= 1) {
++                const unsigned long long ot = __shfl_xor_sync(0xffffffff, k, stride);
++                const bool keep_max = ((lane & stride) == 0) == ((lane & size) == 0);
++                k = keep_max ? (ot > k ? ot : k) : (ot < k ? ot : k);
++            }
++        }
++        if (lane < NU) {
++            red_key[warp * NU + lane] = k;
++        }
++    }
++    {
++        float gv = 0.f, uv = 0.f;
++        if (threadIdx.x < FF) {
++            gv = __ldcg(P.shgu + threadIdx.x);
++            uv = __ldcg(P.shgu + FF + threadIdx.x);
++        }
++        __syncthreads();
++        if (threadIdx.x < FF) {
++            act[px(threadIdx.x)] = silu_f(gv) * uv;
++        }
++    }
++    if (threadIdx.x < 64) {
++        const unsigned long long k = red_key[threadIdx.x];
++        int rank = 0;
++#pragma unroll 16
++        for (int j = 0; j < 64; j++) {
++            rank += red_key[j] > k;
++        }
++        if (rank < NU) {
++            const int idx = 255 - (int) (k & 0xFF);
++            sel[rank] = idx;
++            selw[rank] = red_lg[idx];
++        }
++    }
++    __syncthreads();
++    if (warp == 0) {
++        const float e = lane < NU ? __expf(selw[lane] - selw[0]) : 0.f;
++        const float sum = wsum(e);
++        __syncwarp();
++        if (lane < NU) {
++            selw[lane] = e / sum;
++        }
++    }
++    __syncthreads();
++
++    // phase 2: shared down (pairs of q8_0 rows, K = 512), then expert gate/up (q4_K, next row prefetched)
++    constexpr int NSD = D / 2, N2 = NSD + NU * 2 * FF;
++    int u = gw;
++    for (; u < NSD; u += nwg) {
++        const int r2 = 2 * u;
++        stage_row(stage[warp], A.sd + (size_t) r2 * Q8_ROW_F, 2 * Q8_ROW_F, lane);
++        const int sub = lane >> 4, blk = lane & 15;
++        float a = dot_q8_staged<false>(stage[warp] + sub * Q8_ROW_F, blk, blk, act);
++        __syncwarp();
++#pragma unroll
++        for (int o = 8; o > 0; o >>= 1) {
++            a += __shfl_xor_sync(0xffffffff, a, o);
++        }
++        if (blk == 0) {
++            P.shout[r2 + sub] = a;
++        }
++    }
++    auto q4row = [&](int uu) {
++        const int r = uu - NSD, e = r / (2 * FF), j = r % (2 * FF);
++        return (j < FF ? A.gate : A.up) + ((size_t) sel[e] * FF + (j % FF)) * Q4K_ROW;
++    };
++    if (u < N2) {
++        q4_ld cur = load_q4k(q4row(u), lane);
++        for (; u < N2; u += nwg) {
++            q4_ld nxt;
++            if (u + nwg < N2) {
++                nxt = load_q4k(q4row(u + nwg), lane);
++            }
++            const float a = wsum(dot_q4k(cur, xs, lane));
++            if (lane == 0) {
++                P.egu[u - NSD] = a;
++            }
++            cur = nxt;
++        }
++    }
++    grid_sync(P.bar, target);
++
++    // phase 3: expert swiglu (per block), expert down + weighted sum + shared expert + residual
++    {
++        float gv[NU * FF / NT], uv[NU * FF / NT];
++#pragma unroll
++        for (int j = 0; j < NU * FF / NT; j++) {
++            const int k = threadIdx.x + j * NT, e = k / FF, i = k % FF;
++            gv[j] = __ldcg(P.egu + e * 2 * FF + i);
++            uv[j] = __ldcg(P.egu + e * 2 * FF + FF + i);
++        }
++#pragma unroll
++        for (int j = 0; j < NU * FF / NT; j++) {
++            act[px(threadIdx.x + j * NT)] = silu_f(gv[j]) * uv[j];
++        }
++    }
++    __syncthreads();
++    for (int r = gw; r < D; r += nwg) {
++        // lane = (expert in the half) * 8 + superblock * 4 + 64-weight chunk
++        const int eg = lane >> 3, sb = (lane >> 2) & 1, q = lane & 3;
++        float x0 = 0.f, sh = 0.f;
++        if (lane == 0) {
++            x0 = A.x_in[r];
++            sh = __ldcg(P.shout + r);
++        }
++        float a = 0.f;
++#pragma unroll
++        for (int h = 0; h < 2; h++) {
++            const int e = eg + 4 * h;
++            a += selw[e] * dot_q5k(A.down + ((size_t) sel[e] * D + r) * Q5K_ROW + sb * 176, q, act, e * FF + sb * 256 + 64 * q);
++        }
++        a = wsum(a);
++        if (lane == 0) {
++            A.x_out[r] = x0 + (a + scal[1] * sh);
++        }
++    }
++}
++
++unsigned * mega_bar(ggml_backend_cuda_context & ctx) {
++    if (ctx.p60_mega_bar == nullptr) {
++        CUDA_CHECK(cudaMalloc(&ctx.p60_mega_bar, sizeof(unsigned)));
++        CUDA_CHECK(cudaMemset(ctx.p60_mega_bar, 0, sizeof(unsigned)));
++        ctx.p60_mega_epoch = 0;
++    }
++    return ctx.p60_mega_bar;
++}
++
++template <typename KP>
++void mega_launch(ggml_backend_cuda_context & ctx, void (*kernel)(const KP), KP & kp, int n_barriers) {
++    const int nblk = ggml_cuda_info().devices[ctx.device].nsm;
++    kp.bar  = mega_bar(ctx);
++    kp.base = ctx.p60_mega_epoch;
++    void * args[] = { &kp };
++    CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) kernel, dim3(nblk), dim3(NT), args, 0, ctx.stream()));
++    ctx.p60_mega_epoch += (unsigned) (n_barriers * nblk);
++}
++
++} // namespace
++
++void ggml_cuda_p60_mega_gdn(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args) {
++    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), QKV + VD + 2 * HV + VD);
++    gdn_params kp = {};
++    kp.a    = args;
++    kp.qkvc = scratch.get();
++    kp.zv   = kp.qkvc + QKV;
++    kp.gb   = kp.zv + VD;
++    kp.o    = kp.gb + 2 * HV;
++    mega_launch(ctx, p60_mega_gdn_kernel, kp, 2);
++}
++
++void ggml_cuda_p60_mega_moe(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args) {
++    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), 260 + 2 * FF + NU * 2 * FF + D);
++    moe_params kp = {};
++    kp.a      = args;
++    kp.logits = scratch.get();
++    kp.shgu   = kp.logits + 260;
++    kp.egu    = kp.shgu + 2 * FF;
++    kp.shout  = kp.egu + NU * 2 * FF;
++    mega_launch(ctx, p60_mega_moe_kernel, kp, 2);
++}
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+new file mode 100644
+index 000000000..1225e445f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include "common.cuh"
++
++// Persistent single-token kernels for the Qwen3.5/3.6 MoE layer halves on sm_60 (GGML_CUDA_P60_MEGA=1).
++// One cooperative launch runs a whole half of a layer: all blocks stay resident and sync with a grid barrier
++// between phases, so the ~30 small kernels of a half become 3 phases.
++
++// gated delta net half: attn_norm -> qkv (+ conv, silu, conv-state update), z, alpha, beta -> recurrence (+ state
++// update) -> gated norm -> ssm_out -> residual add
++struct ggml_cuda_p60_mega_gdn_args {
++    const float * x_in;      // layer input [2048]
++    float *       x_out;     // attn_residual [2048]
++    const float * attn_norm; // [2048]
++    float         eps_norm;
++    const char *  qkv;       // Q8_0 [8192 rows of 2048]
++    const char *  z;         // Q8_0 [4096 rows of 2048]
++    const char *  out;       // Q8_0 [2048 rows of 4096]
++    const float * alpha;     // [32 rows of 2048]
++    const float * beta;      // [32 rows of 2048]
++    const float * dt;        // [32]
++    const float * a;         // [32]
++    const float * conv;      // [8192][4]
++    const float * snorm;     // [128]
++    float         eps_l2;    // rms_norm eps of the q/k l2 norm
++    float         scale_l2;  // scale after it
++    float         eps_gn;    // rms_norm eps of the gated norm
++    const float * cs_base;   // conv-state cache, row cs_ids[0] is read
++    const int32_t * cs_ids;
++    int64_t       cs_row;    // row stride in floats
++    float *       cs_out;    // updated conv state
++    const float * ss_base;   // recurrent-state cache, row ss_ids[0] is read
++    const int32_t * ss_ids;
++    int64_t       ss_row;
++    float *       ss_out;    // updated recurrent state
++};
++
++// MoE half: post-attention norm -> router top-8 + shared expert gate -> expert gate/up + shared down -> expert down,
++// weighted sum, shared expert -> residual add
++struct ggml_cuda_p60_mega_moe_args {
++    const float * x_in;   // attn_residual [2048]
++    float *       x_out;  // l_out [2048]
++    const float * norm;   // post_attention_norm [2048]
++    float         eps;
++    const float * router; // [256 rows of 2048]
++    const float * sgate;  // [2048]
++    const char *  gate;   // Q4_K [256][512 rows of 2048]
++    const char *  up;     // Q4_K
++    const char *  down;   // Q5_K [256][2048 rows of 512]
++    const char *  sg;     // Q8_0 [512 rows of 2048]
++    const char *  su;     // Q8_0
++    const char *  sd;     // Q8_0 [2048 rows of 512]
++};
++
++void ggml_cuda_p60_mega_gdn(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args);
++void ggml_cuda_p60_mega_moe(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args);
+-- 
+2.56.0
+

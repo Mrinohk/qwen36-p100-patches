@@ -1,0 +1,51 @@
+From 06b6e84139e64b2b0bf2c1b4dcaf8c5438547f42 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 13:39:29 -0400
+Subject: [PATCH 16/31] cuda : also use CUBLAS_GEMM_ALGO6 for short-row GEMMs
+ from 256 columns on GP100
+
+Extends the previous commit to K < 5120 (Qwen3.6-35B's dense attention,
+GDN and shared-expert GEMMs) when the batch has at least 256 columns. On
+those shapes ALGO6 is equal or faster from 256 columns and slower below
+(35B pp32 -14%, pp64 -11% if taken everywhere), so tiny batches keep the
+default. The main gain is accuracy: with the default, the 35B's ub=512
+prefill logits drift from the ub=1 decode logits by KLD 0.0074 (same top
+95.9%, PPL ratio 1.0082); with ALGO6 by 0.0053 (97.1%, 1.0012). The
+remainder comes from the MMQ expert path.
+
+Qwen3.6-35B UD-Q4_K_XL, 2x P100, b 6144 ub 1536: pp32/64/128 unchanged,
+pp512 648.3 -> 667.9 (+3.0%), pp2048 862.3 -> 865.8 t/s. Qwen3.8-27B is
+unaffected (all its GEMMs have K >= 5120 and already take ALGO6).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d551c5d1b..e5bea52d5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1551,14 +1551,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  (float       *)  dst_ptr, ne0));
+     } else if (ne12 == 1 && ne13 == 1) {
+-        // GP100, f16 compute, long rows (K >= 5120): the default heuristic picks slow kernels, worst at 512-1024
+-        // columns (ffn_down 17408 -> 5120 at 768 columns: 32 ms vs 9 ms). CUBLAS_GEMM_ALGO6 is faster at every
+-        // measured column count (64-4096) for these shapes; for K <= 4096 it is mixed, so those keep the default.
++        // GP100, f16 compute: the default cuBLAS heuristic picks slow and less accurate kernels for prefill GEMMs.
++        // CUBLAS_GEMM_ALGO6 for long rows (K >= 5120) at any column count: faster at 64-4096 columns, worst case
++        // 512-1024 (ffn_down 17408 -> 5120 at 768 columns: 32 ms vs 9 ms). For K < 5120 it is only taken from 256
++        // columns: equal or faster there, slower on tiny batches. Both: closer to the decode path (lower KLD).
+         // Only with GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_GEMM_ALGO=0 turns it off. Falls back if algo 6 is refused.
+         static const bool p60_algo = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
+             (getenv("GGML_CUDA_P60_GEMM_ALGO") == nullptr || atoi(getenv("GGML_CUDA_P60_GEMM_ALGO")) != 0);
+         cublasStatus_t st = CUBLAS_STATUS_NOT_SUPPORTED;
+-        if (p60_algo && cc == GGML_CUDA_CC_PASCAL && cu_compute_type == CUBLAS_COMPUTE_16F && ne10 >= 5120) {
++        if (p60_algo && cc == GGML_CUDA_CC_PASCAL && cu_compute_type == CUBLAS_COMPUTE_16F && (ne10 >= 5120 || ne11 >= 256)) {
+             st = cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+                     alpha, src0_ptr, cu_data_type_a, s01,
+-- 
+2.56.0
+

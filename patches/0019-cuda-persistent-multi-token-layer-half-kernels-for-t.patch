@@ -1,0 +1,1090 @@
+From bb758eb4d609f4a133c46f7a4a6399eb12b76626 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 09:22:18 -0400
+Subject: [PATCH 19/31] cuda : persistent multi-token layer-half kernels for
+ the Qwen3.5/3.6 MoE MTP verify on sm_60
+
+Extends GGML_CUDA_P60_MEGA=1 to batches of 2..6 tokens (the MTP verify pass) and to the gated delta net with
+recurrent-state snapshots (n_rs_seq > 0), which the MTP server uses at every batch size.
+
+p60-mega-t.cu: one cooperative launch per layer half, templated on the token count. Activations are fp16 in shared
+memory (pre-permuted so weight words pair up as half2), products are HFMA2 with short half2 chains flushed to fp32.
+The MoE half computes the union of the tokens' experts once per row and loops only over the tokens routed to it;
+the expert-down phase is split across blocks by cost. The GDN half writes the K conv and recurrent-state snapshots
+with llama.cpp's slot semantics. The matchers verify every snapshot copy (source offset, cache slot, stride) and
+fall back to the normal path otherwise; single-token MoE keeps the fp32 kernel.
+
+2x P100, Qwen3.6-35B-A3B UD-Q4_K_XL, 8 prompts x 256 tokens, MTP n5 + draft vocab:
+  greedy        122.0 -> 157.6 t/s (+29%)
+  prod sampler  116.1 -> 151.1 t/s (+30%), acceptance unchanged
+Not bit-exact: wikitext KLD vs the stock ub=1 base at -ub 6 is 0.00430 (stock -ub 6: 0.00390), PPL 6.6118 vs
+6.6112, same gap as the single-token path.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  93 +++-
+ ggml/src/ggml-cuda/p60-mega-t.cu | 861 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/p60-mega.cuh  |   7 +
+ 3 files changed, 947 insertions(+), 14 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/p60-mega-t.cu
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9e1f2c730..69b43549e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3780,7 +3780,7 @@ static bool p60_mat(const ggml_tensor * t, ggml_type type, int64_t ne0, int64_t
+ static int p60_mega_fail(int line, const ggml_tensor * t, const ggml_tensor * at = nullptr) {
+     static const bool dbg = getenv("GGML_CUDA_P60_MEGA_DEBUG") != nullptr;
+     static std::map<int, int> n;
+-    if (dbg && t->ne[1] == 1 && n[line]++ < 12) {
++    if (dbg && t->ne[1] <= 6 && n[line]++ < 12) {
+         fprintf(stderr, "p60-mega: no match at line %d (%s %s) at %s %s src0 %s src1 %s\n", line, ggml_op_desc(t), t->name,
+             at ? ggml_op_desc(at) : "-", at ? at->name : "-", at && at->src[0] ? at->src[0]->name : "-", at && at->src[1] ? at->src[1]->name : "-");
+     }
+@@ -3816,6 +3816,8 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     const ggml_tensor * qkv = nullptr, * z = nullptr, * out = nullptr, * alpha = nullptr, * beta = nullptr;
+     const ggml_tensor * dt = nullptr, * ssa = nullptr, * conv = nullptr, * snorm = nullptr, * cs_get = nullptr, * ss_get = nullptr;
+     const ggml_tensor * cs_cpy = nullptr, * ss_cpy = nullptr, * gdn = nullptr;
++    const ggml_tensor * cs_snap[6];   // conv-state snapshot copies (n_rs_seq > 0): views of conv_input -> cache slots
++    int n_cs_snap = 0;
+     float eps_l2 = -1.0f, scale_l2 = -1.0f, eps_gn = -1.0f;
+     ggml_tensor * prerun[8];
+     int n_prerun = 0;
+@@ -3854,6 +3856,11 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+                     cs_cpy = t;
+                 } else if (p60_is_node(t->src[0], "new_state", il)) {
+                     ss_cpy = t;
++                } else if (t->src[0]->op == GGML_OP_VIEW && p60_is_node(t->src[0]->view_src, "conv_input", il) && n_cs_snap < 6) {
++                    cs_snap[n_cs_snap++] = t;
++                } else if (t->src[0]->op == GGML_OP_VIEW && t->src[0]->view_src != nullptr &&
++                        t->src[0]->view_src->op == GGML_OP_GATED_DELTA_NET && ss_cpy == nullptr) {
++                    ss_cpy = t;
+                 } else {
+                     P60_MEGA_FAIL;
+                 }
+@@ -3912,19 +3919,67 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+         }
+     }
+     const ggml_tensor * add = g->nodes[e];
+-    if (!qkv || !z || !out || !alpha || !beta || !dt || !ssa || !conv || !snorm || !cs_get || !ss_get || !cs_cpy || !ss_cpy || !gdn ||
+-            eps_l2 < 0.0f || scale_l2 < 0.0f || eps_gn < 0.0f || add->src[1] != norm->src[0]) {
++    if (!qkv || !z || !out || !alpha || !beta || !dt || !ssa || !conv || !snorm || !cs_get || !ss_get || !ss_cpy || !gdn ||
++            (cs_cpy == nullptr) == (n_cs_snap == 0) || eps_l2 < 0.0f || scale_l2 < 0.0f || eps_gn < 0.0f || add->src[1] != norm->src[0]) {
++        P60_MEGA_FAIL;
++    }
++    // one sequence of T <= 6 tokens; the gdn output holds T rows of attention values + K state snapshots
++    const int64_t T = gdn->src[0]->ne[2];
++    const int64_t K = (gdn->ne[1] - T) / 128;
++    constexpr int64_t SSN = 128*128*32;
++    if (T < 1 || T > 6 || K < 1 || K > 6 || gdn->ne[1] != T + 128*K || norm->src[0]->ne[1] != T) {
+         P60_MEGA_FAIL;
+     }
+-    // single token, single sequence, no state snapshots (output = attention values + one state)
+-    if (gdn->src[0]->ne[2] != 1 || gdn->src[0]->ne[3] != 1 || gdn->ne[0] != 4096 || gdn->ne[1] != 128 + 1 ||
++    int64_t cs_slot = 0, ss_slot = 0;
++    if (n_cs_snap > 0) {
++        // snapshot mode (n_rs_seq = K - 1 > 0): K conv-state copies, slot s <- conv_input[max(0, T - s) .. + 2], slots
++        // evenly spaced in the cache; one copy of the min(T, K) state snapshots that follow the T output rows
++        const ggml_tensor * ci = cs_snap[0]->src[0]->view_src;
++        if (n_cs_snap != K || K < 2 || ci->op != GGML_OP_CONCAT || ci->ne[0] != T + 3 || ci->ne[1] != 8192 || ci->type != GGML_TYPE_F32 ||
++                !ggml_is_contiguous(ci)) {
++            P60_MEGA_FAIL;
++        }
++        const char * lo = (const char *) cs_snap[0]->data, * hi = lo;
++        for (int k = 1; k < n_cs_snap; k++) {
++            lo = std::min(lo, (const char *) cs_snap[k]->data);
++            hi = std::max(hi, (const char *) cs_snap[k]->data);
++        }
++        const int64_t step = (hi - lo) / (K - 1);
++        if (step <= 0 || (hi - lo) % (K - 1) != 0 || step % sizeof(float) != 0) {
++            P60_MEGA_FAIL;
++        }
++        int seen = 0;
++        for (int k = 0; k < n_cs_snap; k++) {
++            const ggml_tensor * c = cs_snap[k], * v = c->src[0];
++            const int64_t d = (const char *) c->data - lo, slot = d / step;
++            if (d % step != 0 || slot >= K || (seen & (1 << slot)) || v->ne[0] != 3 || v->ne[1] != 8192 || v->ne[2] != 1 || v->nb[1] != ci->nb[1] ||
++                    v->view_offs != std::max<int64_t>(0, T - slot) * sizeof(float) || ggml_nelements(c) != 3*8192 || !ggml_is_contiguous(c)) {
++                P60_MEGA_FAIL;
++            }
++            seen |= 1 << slot;
++        }
++        cs_slot = step / sizeof(float);
++        cs_cpy  = nullptr;
++        const ggml_tensor * sv = ss_cpy->src[0], * sd = ss_cpy->src[1];
++        if (sv->view_src != gdn || sv->ne[0] != SSN || sv->ne[1] != 1 || sv->ne[2] != std::min(T, K) || sv->nb[2] != SSN*sizeof(float) ||
++                sv->view_offs != (size_t) 4096*T*sizeof(float) || sd->ne[0] != SSN || sd->nb[2] % sizeof(float) != 0 ||
++                ss_cpy->type != GGML_TYPE_F32 || sd->nb[0] != sizeof(float)) {
++            P60_MEGA_FAIL;
++        }
++        ss_slot = sd->nb[2] / sizeof(float);
++    } else if (K != 1 || ggml_nelements(cs_cpy) != 3*8192 || ggml_nelements(ss_cpy) != SSN || !ggml_is_contiguous(cs_cpy) ||
++            !ggml_is_contiguous(ss_cpy) || cs_cpy->src[0]->view_offs != (size_t) T*sizeof(float) ||
++            (T > 1 && (ss_cpy->src[0]->view_src != gdn || ss_cpy->src[0]->view_offs != (size_t) 4096*T*sizeof(float)))) {
++        // no snapshots: the conv state after the T tokens, the recurrent state after the last one
++        P60_MEGA_FAIL;
++    }
++    if (gdn->src[0]->ne[3] != 1 || gdn->ne[0] != 4096 ||
+             !p60_mat(qkv, GGML_TYPE_Q8_0, 2048, 8192) || !p60_mat(z, GGML_TYPE_Q8_0, 2048, 4096) || !p60_mat(out, GGML_TYPE_Q8_0, 4096, 2048) ||
+             !p60_mat(alpha, GGML_TYPE_F32, 2048, 32) || !p60_mat(beta, GGML_TYPE_F32, 2048, 32) || !p60_mat(conv, GGML_TYPE_F32, 4, 8192) ||
+             !p60_f32_vec(dt, 32) || !p60_f32_vec(ssa, 32) || !p60_f32_vec(snorm, 128) || !p60_f32_vec(nmul->src[1], 2048) ||
+-            !p60_f32_vec(norm->src[0], 2048) || !p60_f32_vec(add, 2048) ||
+-            cs_get->src[0]->nb[1] != 3*8192*sizeof(float) || ss_get->src[0]->nb[1] != 128*128*32*sizeof(float) ||
++            !p60_f32_vec(norm->src[0], 2048*T) || !p60_f32_vec(add, 2048*T) ||
++            cs_get->src[0]->nb[1] != 3*8192*sizeof(float) || ss_get->src[0]->nb[1] != SSN*sizeof(float) ||
+             cs_get->src[1]->type != GGML_TYPE_I32 || ss_get->src[1]->type != GGML_TYPE_I32 ||
+-            ggml_nelements(cs_cpy) != 3*8192 || ggml_nelements(ss_cpy) != 128*128*32 || !ggml_is_contiguous(cs_cpy) || !ggml_is_contiguous(ss_cpy) ||
+             !p60_range_private(g, i, e, add)) {
+         P60_MEGA_FAIL;
+     }
+@@ -3939,13 +3994,18 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     a.dt = (const float *) dt->data; a.a = (const float *) ssa->data; a.conv = (const float *) conv->data; a.snorm = (const float *) snorm->data;
+     a.eps_l2 = eps_l2; a.scale_l2 = scale_l2; a.eps_gn = eps_gn;
+     a.cs_base = (const float *) cs_get->src[0]->data; a.cs_ids = (const int32_t *) cs_get->src[1]->data; a.cs_row = cs_get->src[0]->nb[1] / sizeof(float);
+-    a.cs_out = (float *) cs_cpy->data;
++    a.cs_out = cs_cpy ? (float *) cs_cpy->data : (float *) std::min_element(cs_snap, cs_snap + n_cs_snap,
++        [](const ggml_tensor * x, const ggml_tensor * y) { return (const char *) x->data < (const char *) y->data; })[0]->data;
+     a.ss_base = (const float *) ss_get->src[0]->data; a.ss_ids = (const int32_t *) ss_get->src[1]->data; a.ss_row = ss_get->src[0]->nb[1] / sizeof(float);
+     a.ss_out = (float *) ss_cpy->data;
+     for (int k = 0; k < n_prerun; k++) {
+         ggml_cuda_compute_forward(*ctx, prerun[k]);
+     }
+-    ggml_cuda_p60_mega_gdn(*ctx, a);
++    if (cs_cpy && T == 1) {
++        ggml_cuda_p60_mega_gdn(*ctx, a);
++    } else {
++        ggml_cuda_p60_mega_gdn_t(*ctx, a, (int) T, (int) K, cs_slot, ss_slot);
++    }
+     return e - i;
+ }
+ 
+@@ -3977,6 +4037,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     const ggml_tensor * router = nullptr, * sgate = nullptr, * gate = nullptr, * up = nullptr, * down = nullptr;
+     const ggml_tensor * sg = nullptr, * su = nullptr, * sd = nullptr, * ids = nullptr;
+     int n_softmax = 0, n_div = 0;
++    const int64_t T = norm->src[0]->ne[1];
+     for (int k = i + 2; k < e; k++) {
+         const ggml_tensor * t = g->nodes[k];
+         cur_t = t;
+@@ -4013,7 +4074,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+                 else if (p60_is_weight(t->src[0], il, "ffn_down_exps.weight")) down = t->src[0];
+                 else P60_MEGA_FAIL;
+                 ids = t->src[2];
+-                if (t->src[1]->ne[2] != 1) P60_MEGA_FAIL; // one token
++                if (t->src[1]->ne[2] != T) P60_MEGA_FAIL;
+                 break;
+             default:
+                 P60_MEGA_FAIL;
+@@ -4021,12 +4082,12 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     }
+     const ggml_tensor * add = g->nodes[e];
+     if (!router || !sgate || !gate || !up || !down || !sg || !su || !sd || !ids || n_softmax != 1 || n_div != 1 ||
+-            ids->ne[0] != 8 || ids->ne[1] != 1 ||
++            T < 1 || T > 6 || ids->ne[0] != 8 || ids->ne[1] != T ||
+             !p60_mat(router, GGML_TYPE_F32, 2048, 256) || !p60_f32_vec(sgate, 2048) ||
+             !p60_mat(gate, GGML_TYPE_Q4_K, 2048, 512, 256) || !p60_mat(up, GGML_TYPE_Q4_K, 2048, 512, 256) ||
+             !p60_mat(down, GGML_TYPE_Q5_K, 512, 2048, 256) ||
+             !p60_mat(sg, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(su, GGML_TYPE_Q8_0, 2048, 512) || !p60_mat(sd, GGML_TYPE_Q8_0, 512, 2048) ||
+-            !p60_f32_vec(nmul->src[1], 2048) || !p60_f32_vec(norm->src[0], 2048) || !p60_f32_vec(add, 2048) ||
++            !p60_f32_vec(nmul->src[1], 2048) || !p60_f32_vec(norm->src[0], 2048*T) || !p60_f32_vec(add, 2048*T) ||
+             !p60_range_private(g, i, e, add)) {
+         P60_MEGA_FAIL;
+     }
+@@ -4040,7 +4101,11 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     a.router = (const float *) router->data; a.sgate = (const float *) sgate->data;
+     a.gate = (const char *) gate->data; a.up = (const char *) up->data; a.down = (const char *) down->data;
+     a.sg = (const char *) sg->data; a.su = (const char *) su->data; a.sd = (const char *) sd->data;
+-    ggml_cuda_p60_mega_moe(*ctx, a);
++    if (T == 1) {
++        ggml_cuda_p60_mega_moe(*ctx, a);
++    } else {
++        ggml_cuda_p60_mega_moe_t(*ctx, a, (int) T);
++    }
+     return e - i;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/p60-mega-t.cu b/ggml/src/ggml-cuda/p60-mega-t.cu
+new file mode 100644
+index 000000000..3c86b9a11
+--- /dev/null
++++ b/ggml/src/ggml-cuda/p60-mega-t.cu
+@@ -0,0 +1,861 @@
++#include "p60-mega.cuh"
++
++// Persistent multi-token (T = 2..6, MTP verify) kernels for the Qwen3.5/3.6 MoE layer halves on sm_60, plus the gated
++// delta net half with recurrent-state snapshots (n_rs_seq > 0, also at T = 1). See p60-mega.cuh.
++// Activations are fp16 in shared memory, groups of 4 stored as [x0, x2, x1, x3] so that a 32-bit weight word turns
++// into half2 pairs (w0, w2), (w1, w3) that line up with a uint2 load of x. Products are HFMA2 (half2 FMA) with
++// short half2 accumulation chains flushed to fp32; everything else is fp32.
++
++namespace {
++namespace mt {
++
++constexpr int NT = 512, NW = NT / 32, TM = 6;
++
++__device__ __forceinline__ float wsum(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        v += __shfl_xor_sync(0xffffffff, v, o);
++    }
++    return v;
++}
++
++// padded smem index: lanes reading at k strides of 64 elements land in different banks
++__device__ __forceinline__ int px(int k) { return k + 4 * (k >> 6); }
++__device__ __forceinline__ float dot4(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
++__device__ __forceinline__ float silu(float v) { return v / (1.f + __expf(-v)); }
++
++// copy bytes (multiple of 16) of a row into per-warp smem with 16 B loads
++__device__ __forceinline__ void stage_row(uint8_t * dst, const uint8_t * src, int bytes, int lane) {
++    for (int i = lane; i < bytes / 16; i += 32) {
++        ((int4 *) dst)[i] = __ldg((const int4 *) src + i);
++    }
++    __syncwarp();
++}
++
++// position of element k in a pre-permuted fp16 row (then px padding)
++__device__ __forceinline__ int pp(int k) { const int g = k & 3; return px((k & ~3) | ((g & 1) << 1) | (g >> 1)); }
++
++// 4 pre-permuted halves (8 B aligned) -> float4 in element order
++__device__ __forceinline__ float4 ld4h(const __half * p) {
++    const uint2 v = *(const uint2 *) p;
++    const float2 a = __half22float2(*(const half2 *) &v.x), b = __half22float2(*(const half2 *) &v.y);
++    return make_float4(a.x, b.x, a.y, b.y);
++}
++
++__device__ __forceinline__ float h2sum(half2 a) { const float2 f = __half22float2(a); return f.x + f.y; }
++
++// grid barrier on a counter that keeps growing across launches (wrap-safe)
++__device__ __forceinline__ void tsync(unsigned * bar, unsigned & target) {
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        target += gridDim.x;
++        __threadfence();
++        atomicAdd(bar, 1u);
++        while ((int) (*(volatile unsigned *) bar - target) < 0) {}
++        __threadfence();
++    }
++    __syncthreads();
++}
++
++// one q8_0 block (staged, 34 B, 2 B aligned) against the pre-permuted fp16 rows of T tokens (row stride `stride`,
++// block xblk of x). int8 weights -> exact half2 pairs once; the half2 accumulator is flushed to fp32 every 8 products.
++__device__ __forceinline__ void dot_q8h_T(const uint8_t * stage, int blk, int xblk, const __half * x16, int stride, int T, float acc[TM]) {
++    const uint8_t * b = stage + 34 * blk;
++    const float d = __half2float(*(const half *) b);
++    const unsigned short * qs = (const unsigned short *) (b + 2);
++    const half2 off = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480)); // 1152 = 1024 + 128
++    half2 w02[8], w13[8];
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const unsigned v = (qs[2 * i] | ((unsigned) qs[2 * i + 1] << 16)) ^ 0x80808080;
++        const unsigned a02 = (v & 0x00FF00FF) | 0x64006400u, a13 = ((v >> 8) & 0x00FF00FF) | 0x64006400u;
++        w02[i] = __hsub2(*(const half2 *) &a02, off);
++        w13[i] = __hsub2(*(const half2 *) &a13, off);
++    }
++    const int xo = px(32 * xblk); // a 32-element block never crosses a 64-element padding boundary
++#pragma unroll
++    for (int t = 0; t < TM; t++) {
++        if (t < T) {
++            const __half * xb = x16 + t * stride + xo;
++            float f = 0.f;
++#pragma unroll
++            for (int h = 0; h < 2; h++) {
++                half2 a = __float2half2_rn(0.f);
++#pragma unroll
++                for (int i = 4 * h; i < 4 * h + 4; i++) {
++                    const uint2 x = *(const uint2 *) (xb + 4 * i);
++                    a = __hfma2(w02[i], *(const half2 *) &x.x, a);
++                    a = __hfma2(w13[i], *(const half2 *) &x.y, a);
++                }
++                f += h2sum(a);
++            }
++            acc[t] += d * f;
++        }
++    }
++}
++
++
++// compile-time T version of dot_q8h_T: no per-token branches, so the compiler interleaves the tokens' chains
++template <int T>
++__device__ __forceinline__ void dot_q8h(const uint8_t * stage, int blk, int xblk, const __half * x16, int stride, float acc[TM]) {
++    const uint8_t * b = stage + 34 * blk;
++    const float d = __half2float(*(const half *) b);
++    const unsigned short * qs = (const unsigned short *) (b + 2);
++    const half2 off = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));
++    half2 w02[8], w13[8];
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const unsigned v = (qs[2 * i] | ((unsigned) qs[2 * i + 1] << 16)) ^ 0x80808080;
++        const unsigned a02 = (v & 0x00FF00FF) | 0x64006400u, a13 = ((v >> 8) & 0x00FF00FF) | 0x64006400u;
++        w02[i] = __hsub2(*(const half2 *) &a02, off);
++        w13[i] = __hsub2(*(const half2 *) &a13, off);
++    }
++    const int xo = px(32 * xblk);
++#pragma unroll
++    for (int t = 0; t < T; t++) {
++        const __half * xb = x16 + t * stride + xo;
++        float f = 0.f;
++#pragma unroll
++        for (int h = 0; h < 2; h++) {
++            half2 a0 = __float2half2_rn(0.f), a1 = a0; // two chains: half the dependency depth
++#pragma unroll
++            for (int i = 4 * h; i < 4 * h + 4; i++) {
++                const uint2 x = *(const uint2 *) (xb + 4 * i);
++                a0 = __hfma2(w02[i], *(const half2 *) &x.x, a0);
++                a1 = __hfma2(w13[i], *(const half2 *) &x.y, a1);
++            }
++            f += h2sum(__hadd2(a0, a1));
++        }
++        acc[t] += d * f;
++    }
++}
++
++// rms norm of T token rows (fp32, global) into pre-permuted fp16 rows (stride XS), one warp per token; a lane owns 64
++// contiguous elements and issues all its loads up front. Optional fp32 sums of the 32-element sub-blocks.
++template <int D, int XS>
++__device__ __forceinline__ void norm_T(const float * x_in, const float * w, float eps, int T, __half * xs16, float * xsum) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    static_assert(D == 64 * 32, "one warp covers a 2048 row");
++    if (warp < T) {
++        const int t = warp, k0 = 64 * lane;
++        float4 xv[16];
++#pragma unroll
++        for (int i = 0; i < 16; i++) xv[i] = *(const float4 *) (x_in + t * D + k0 + 4 * i);
++        float ss = 0.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) ss += dot4(xv[i], xv[i]);
++        const float r = rsqrtf(wsum(ss) / D + eps);
++        float s0 = 0.f, s1 = 0.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) {
++            const float4 nw = __ldg((const float4 *) (w + k0 + 4 * i));
++            const float v[4] = {xv[i].x * r * nw.x, xv[i].y * r * nw.y, xv[i].z * r * nw.z, xv[i].w * r * nw.w};
++#pragma unroll
++            for (int c = 0; c < 4; c++) {
++                const __half h = __float2half(v[c]);
++                xs16[t * XS + pp(k0 + 4 * i + c)] = h;
++                if (i < 8) s0 += __half2float(h); else s1 += __half2float(h);
++            }
++        }
++        if (xsum) { xsum[t * 64 + 2 * lane] = s0; xsum[t * 64 + 2 * lane + 1] = s1; }
++    }
++    __syncthreads();
++}
++
++} // namespace mt
++
++// ================= MoE half =================
++namespace moe {
++using namespace mt;
++
++constexpr int P3_ROW_COST = 4;
++constexpr int D = 2048, NE = 256, NU = 8, FF = 512;
++constexpr int Q4K_ROW = D / 256 * 144, Q5K_ROW = FF / 256 * 176, Q8_ROW_D = D / 32 * 34, Q8_ROW_F = FF / 32 * 34, HALF = 1088;
++constexpr int XS = D + D / 16;       // padded row length (px) of a token's x
++constexpr int AS = FF + FF / 16;     // padded row length (px) of a swiglu vector
++constexpr int MAXU = TM * NU;        // union size bound
++
++struct Layer {
++    const float * norm; const float * router; const float * sgate;
++    const uint8_t * gate; const uint8_t * up; const uint8_t * down; const uint8_t * sg; const uint8_t * su; const uint8_t * sd;
++};
++struct Params {
++    Layer L;
++    const float * x_in; // [T][D]
++    float * x_out;      // [T][D]
++    float eps;
++    float * logits;     // [TM][NE + 1]
++    float * shgu;       // [TM][2 FF]
++    float * egu;        // [MAXU][TM][2 FF]
++    float * shout;      // [TM][D]
++    float * ypart;      // [TM][NU][D]
++    unsigned * bar;
++    unsigned base;
++};
++
++__device__ __forceinline__ half2 nib2h(unsigned v) { // two nibbles at bits 0-3 and 16-19 -> half2 of their values
++    return __hsub2(*(const half2 *) &(const unsigned &) (v | 0x64006400u), __halves2half2(__ushort_as_half(0x6400), __ushort_as_half(0x6400)));
++}
++__device__ __forceinline__ void scale_min_k4(int j, unsigned s0, unsigned s1, unsigned s2, int & d, int & m) {
++    const int sh = 8 * (j & 3);
++    const int b0 = (s0 >> sh) & 0xFF, b1 = (s1 >> sh) & 0xFF, b2 = (s2 >> sh) & 0xFF;
++    // branchless: lanes of one warp take both cases (j = 2q, 2q+1 with q = lane & 3), a branch would diverge
++    const bool lo = j < 4;
++    d = lo ? (b0 & 63) : ((b2 & 0xF) | ((b0 >> 6) << 4));
++    m = lo ? (b1 & 63) : ((b2 >> 4) | ((b1 >> 6) << 4));
++}
++
++struct q4_ld { int4 h, qa, qb; };
++__device__ __forceinline__ q4_ld load_q4k(const uint8_t * row, int lane) {
++    const uint8_t * b = row + (lane >> 2) * 144;
++    const int q = lane & 3;
++    return {__ldg((const int4 *) b), __ldg((const int4 *) (b + 16 + 32 * q)), __ldg((const int4 *) (b + 32 + 32 * q))};
++}
++struct q5_ld { int4 h, ha, hb, qa, qb; };
++__device__ __forceinline__ q5_ld load_q5k(const uint8_t * b, int q) {
++    return {__ldg((const int4 *) b), __ldg((const int4 *) (b + 16)), __ldg((const int4 *) (b + 32)), __ldg((const int4 *) (b + 48 + 32 * q)), __ldg((const int4 *) (b + 64 + 32 * q))};
++}
++
++// ---- per-token dots: weights converted once per lane, then a real loop over only the tokens that use the row ----
++// (unrolled 6-token loops get predicated: every row paid for all 6 tokens, ~1.6 are used on average)
++struct w64 { half2 l02[8], l13[8], h02[8], h13[8]; float dl, dh, ml, mh; };
++__device__ __forceinline__ void prep_q4k(const q4_ld & L, int q, w64 & w) {
++    int s0, m0, s1, m1;
++    scale_min_k4(2 * q, L.h.y, L.h.z, L.h.w, s0, m0);
++    scale_min_k4(2 * q + 1, L.h.y, L.h.z, L.h.w, s1, m1);
++    const unsigned v[8] = {(unsigned) L.qa.x, (unsigned) L.qa.y, (unsigned) L.qa.z, (unsigned) L.qa.w, (unsigned) L.qb.x, (unsigned) L.qb.y, (unsigned) L.qb.z, (unsigned) L.qb.w};
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        w.l02[i] = nib2h(v[i] & 0x000F000F); w.l13[i] = nib2h((v[i] >> 8) & 0x000F000F);
++        w.h02[i] = nib2h((v[i] >> 4) & 0x000F000F); w.h13[i] = nib2h((v[i] >> 12) & 0x000F000F);
++    }
++    const float d = __half2float(__ushort_as_half(L.h.x & 0xFFFF)), dmin = __half2float(__ushort_as_half(L.h.x >> 16));
++    w.dl = d * s0; w.dh = d * s1; w.ml = dmin * m0; w.mh = dmin * m1;
++}
++__device__ __forceinline__ void prep_q5k(const q5_ld & L, int q, w64 & w) {
++    int s0, m0, s1, m1;
++    scale_min_k4(2 * q, L.h.y, L.h.z, L.h.w, s0, m0);
++    scale_min_k4(2 * q + 1, L.h.y, L.h.z, L.h.w, s1, m1);
++    const unsigned v[8]  = {(unsigned) L.qa.x, (unsigned) L.qa.y, (unsigned) L.qa.z, (unsigned) L.qa.w, (unsigned) L.qb.x, (unsigned) L.qb.y, (unsigned) L.qb.z, (unsigned) L.qb.w};
++    const unsigned hh[8] = {(unsigned) L.ha.x, (unsigned) L.ha.y, (unsigned) L.ha.z, (unsigned) L.ha.w, (unsigned) L.hb.x, (unsigned) L.hb.y, (unsigned) L.hb.z, (unsigned) L.hb.w};
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const unsigned lo5 = (v[i] & 0x0F0F0F0F) | (((hh[i] >> (2 * q)) & 0x01010101) << 4);
++        const unsigned hi5 = ((v[i] >> 4) & 0x0F0F0F0F) | (((hh[i] >> (2 * q + 1)) & 0x01010101) << 4);
++        w.l02[i] = nib2h(lo5 & 0x001F001F); w.l13[i] = nib2h((lo5 >> 8) & 0x001F001F);
++        w.h02[i] = nib2h(hi5 & 0x001F001F); w.h13[i] = nib2h((hi5 >> 8) & 0x001F001F);
++    }
++    const float d = __half2float(__ushort_as_half(L.h.x & 0xFFFF)), dmin = __half2float(__ushort_as_half(L.h.x >> 16));
++    w.dl = d * s0; w.dh = d * s1; w.ml = dmin * m0; w.mh = dmin * m1;
++}
++// one token: x16 = its pre-permuted fp16 row (px layout), base = element index of the 64-weight chunk, sl/sh = fp32
++// sums of the chunk's two 32-element sub-blocks
++__device__ __forceinline__ float dot1(const w64 & w, const __half * x16, int base, float sl, float sh) {
++    half2 al = __float2half2_rn(0.f), ah = al;
++    // base is a multiple of 64, so the 64-element chunk has one px() padding offset: one pointer, immediate offsets
++    const __half * xb = x16 + px(base);
++#pragma unroll
++    for (int i = 0; i < 8; i++) {
++        const uint2 lo = *(const uint2 *) (xb + 4 * i), hi = *(const uint2 *) (xb + 32 + 4 * i);
++        al = __hfma2(w.l02[i], *(const half2 *) &lo.x, al); al = __hfma2(w.l13[i], *(const half2 *) &lo.y, al);
++        ah = __hfma2(w.h02[i], *(const half2 *) &hi.x, ah); ah = __hfma2(w.h13[i], *(const half2 *) &hi.y, ah);
++    }
++    return w.dl * h2sum(al) + w.dh * h2sum(ah) - (w.ml * sl + w.mh * sh);
++}
++
++
++template <int TT>
++__global__ void __launch_bounds__(NT, 1) moe_t_kernel(const Params P) {
++    // region A: P0-P2 xs16 [TM][XS]; P3 act16 [2 experts * TM][AS] + shared act16 [TM][AS]
++    __shared__ __align__(16) __half regA[TM * XS];
++    __shared__ __align__(16) uint8_t stage[NW][Q4K_ROW]; // 1152 B: one q4_K row, or a q8_0 half row
++    __shared__ float red[NW][TM], rms[TM], sgv[TM], selw[TM][NU];
++    __shared__ int sel[TM][NU];
++    __shared__ int ulist[MAXU], umaskl[MAXU], wcnt[NW + 1], nU;
++    __shared__ float xsum[TM * 64], asum[2 * TM * 16];
++    __shared__ unsigned char upos[NE], kof[MAXU][TM]; // expert -> union slot; (union slot, token) -> top-8 position
++    const Layer & W = P.L;
++    constexpr int T = TT, allm = (1 << T) - 1;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
++    unsigned target = P.base;
++    __half * xs16 = regA;
++
++    // ---- P0: rms norm of each token -> xs16 (pre-permuted fp16) + fp32 sub-block sums. One warp per token; a lane
++    // owns 64 contiguous elements, all loads issued up front (a load-use loop would pay an L2 round trip per step) ----
++    if (warp < T) {
++        const int t = warp, k0 = 64 * lane;
++        float4 xv[16];
++#pragma unroll
++        for (int i = 0; i < 16; i++) xv[i] = *(const float4 *) (P.x_in + t * D + k0 + 4 * i);
++        float ss = 0.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) ss += dot4(xv[i], xv[i]);
++        const float r = rsqrtf(wsum(ss) / D + P.eps);
++        float s0 = 0.f, s1 = 0.f;
++#pragma unroll
++        for (int i = 0; i < 16; i++) {
++            const float4 nw = __ldg((const float4 *) (W.norm + k0 + 4 * i));
++            const float v[4] = {xv[i].x * r * nw.x, xv[i].y * r * nw.y, xv[i].z * r * nw.z, xv[i].w * r * nw.w};
++#pragma unroll
++            for (int c = 0; c < 4; c++) {
++                const __half h = __float2half(v[c]);
++                xs16[t * XS + pp(k0 + 4 * i + c)] = h;
++                if (i < 8) s0 += __half2float(h); else s1 += __half2float(h);
++            }
++        }
++        xsum[t * 64 + 2 * lane] = s0;
++        xsum[t * 64 + 2 * lane + 1] = s1;
++    }
++    __syncthreads();
++
++    // ---- P1: router + shared gate (f32 rows), shared gate/up (q8_0 rows) ----
++    if (gw <= NE) {
++        float acc[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) acc[t] = 0.f;
++        const float * w = gw < NE ? W.router + (size_t) gw * D : W.sgate;
++#pragma unroll 4
++        for (int i = 0; i < D / 128; i++) {
++            const float4 v = __ldg((const float4 *) (w + 128 * i) + lane);
++#pragma unroll
++            for (int t = 0; t < TM; t++) if (t < T) acc[t] += dot4(v, ld4h(xs16 + t * XS + px(128 * i + 4 * lane)));
++        }
++#pragma unroll
++        for (int t = 0; t < TM; t++) { const float a = wsum(acc[t]); if (lane == 0 && t < T) P.logits[t * (NE + 1) + gw] = a; }
++    }
++    {
++        // shared gate/up rows as a stream of 1088 B chunks (2 per row), the next 2 chunks in registers: staging a row
++        // half by half with nothing in flight cost ~24 us for 2.2 MB
++        const int u0 = gw <= NE ? gw + nwg : gw, NS = NE + 1 + 2 * FF;
++        const int nt = u0 < NS ? 2 * ((NS - u0 + nwg - 1) / nwg) : 0;
++        auto rowp = [&](int u) { const int r = u - NE - 1; return r < FF ? W.sg + (size_t) r * Q8_ROW_D : W.su + (size_t) (r - FF) * Q8_ROW_D; };
++        auto ld = [&](int t_, int4 * bb) {
++            const int4 * p = (const int4 *) (rowp(u0 + (t_ >> 1) * nwg) + (t_ & 1) * HALF);
++            bb[0] = __ldg(p + lane); bb[1] = __ldg(p + 32 + lane); if (lane < 4) bb[2] = __ldg(p + 64 + lane);
++        };
++        int4 b0[3], b1[3];
++        if (nt > 0) ld(0, b0);
++        if (nt > 1) ld(1, b1);
++        float acc[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) acc[t] = 0.f;
++        for (int c = 0; c < nt; c++) {
++            int4 * st = (int4 *) stage[warp];
++            st[lane] = b0[0]; st[32 + lane] = b0[1]; if (lane < 4) st[64 + lane] = b0[2];
++            __syncwarp();
++            b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++            if (c + 2 < nt) ld(c + 2, b1);
++            dot_q8h_T(stage[warp], lane, 32 * (c & 1) + lane, xs16, XS, T, acc);
++            __syncwarp();
++            if (c & 1) {
++                const int r = u0 + (c >> 1) * nwg - NE - 1;
++#pragma unroll
++                for (int t = 0; t < TM; t++) { const float a = wsum(acc[t]); if (lane == 0 && t < T) P.shgu[t * 2 * FF + r] = a; acc[t] = 0.f; }
++            }
++        }
++    }
++    tsync(P.bar, target);
++
++    // ---- P2 prologue: top-8 per token (warp t), shared-gate sigmoid, union of experts ----
++    if (warp < T) {
++        const int t = warp;
++        float v[8];
++        for (int i = 0; i < 8; i++) v[i] = __ldcg(P.logits + t * (NE + 1) + lane + 32 * i);
++        float top0 = 0.f;
++        for (int k = 0; k < NU; k++) {
++            float bv = -INFINITY; int bi = 0x7fffffff;
++            for (int i = 0; i < 8; i++) if (v[i] > bv) { bv = v[i]; bi = lane + 32 * i; }
++            for (int o = 16; o > 0; o >>= 1) {
++                const float ov = __shfl_xor_sync(0xffffffff, bv, o);
++                const int oi = __shfl_xor_sync(0xffffffff, bi, o);
++                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
++            }
++            if (k == 0) top0 = bv;
++            if (lane == 0) { sel[t][k] = bi; selw[t][k] = __expf(bv - top0); }
++#pragma unroll
++            for (int i = 0; i < 8; i++) if (bi == lane + 32 * i) v[i] = -INFINITY; // static index: v stays in registers
++        }
++        __syncwarp();
++        if (lane == 0) {
++            float s = 0.f;
++            for (int k = 0; k < NU; k++) s += selw[t][k];
++            for (int k = 0; k < NU; k++) selw[t][k] /= s;
++            sgv[t] = 1.f / (1.f + __expf(-__ldcg(P.logits + t * (NE + 1) + NE))); // shared-expert gate
++        }
++    }
++    __syncthreads();
++    unsigned um = 0, ub = 0;
++    if (warp < NE / 32) {
++        // token mask of expert threadIdx.x: compare against the T x 8 selections (no bitmap, no atomics)
++        for (int t = 0; t < T; t++)
++#pragma unroll
++            for (int k = 0; k < NU; k++) um |= (sel[t][k] == (int) threadIdx.x) ? 1u << t : 0u;
++        ub = __ballot_sync(0xffffffff, um != 0);
++        if (lane == 0) wcnt[warp] = __popc(ub);
++    }
++    __syncthreads();
++    if (warp < NE / 32) {
++        int off = 0;
++        for (int w = 0; w < warp; w++) off += wcnt[w];
++        if (um) { const int pos = off + __popc(ub & ((1u << lane) - 1)); ulist[pos] = threadIdx.x; umaskl[pos] = um; upos[threadIdx.x] = pos; }
++        if (threadIdx.x == NE - 1) { int s = 0; for (int w = 0; w < NE / 32; w++) s += wcnt[w]; nU = s; }
++    }
++    __syncthreads();
++    if (threadIdx.x < T * NU) { const int t = threadIdx.x / NU, k = threadIdx.x % NU; kof[upos[sel[t][k]]][t] = k; } // slot of (u, t)
++    __syncthreads();
++    const int U = nU;
++
++    // ---- P2: expert gate/up rows of the union: rows streamed with coalesced 16 B loads, next 2 rows in registers ----
++    {
++        const int N2 = U * 2 * FF;
++        auto q4row = [&](int v) {
++            const int u = v / (2 * FF), j = v % (2 * FF);
++            return (j < FF ? W.gate : W.up) + ((size_t) ulist[u] * FF + (j % FF)) * Q4K_ROW;
++        };
++        int4 b0[3], b1[3];
++        auto ld = [&](int v, int4 * bb) {
++            const int4 * p = (const int4 *) q4row(v);
++            bb[0] = __ldg(p + lane); bb[1] = __ldg(p + 32 + lane); if (lane < 8) bb[2] = __ldg(p + 64 + lane);
++        };
++        int v = gw;
++        if (v < N2) ld(v, b0);
++        if (v + nwg < N2) ld(v + nwg, b1);
++        for (; v < N2; v += nwg) {
++            int4 * st = (int4 *) stage[warp];
++            st[lane] = b0[0]; st[32 + lane] = b0[1]; if (lane < 8) st[64 + lane] = b0[2];
++            __syncwarp();
++            b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++            if (v + 2 * nwg < N2) ld(v + 2 * nwg, b1);
++            const uint8_t * sb = stage[warp] + (lane >> 2) * 144;
++            const q4_ld cur = {*(const int4 *) sb, *(const int4 *) (sb + 16 + 32 * (lane & 3)), *(const int4 *) (sb + 32 + 32 * (lane & 3))};
++            __syncwarp();
++            const int u = v / (2 * FF), j = v % (2 * FF);
++            w64 w;
++            prep_q4k(cur, lane & 3, w);
++            const int base = (lane >> 2) * 256 + 64 * (lane & 3), j0 = base >> 5;
++            for (unsigned m = umaskl[u]; m; m &= m - 1) { // warp-uniform loop over the tokens of this expert
++                const int t = __ffs(m) - 1;
++                const float a = wsum(dot1(w, xs16 + t * XS, base, xsum[t * 64 + j0], xsum[t * 64 + j0 + 1]));
++                if (lane == 0) P.egu[((size_t) u * TM + t) * 2 * FF + j] = a;
++            }
++        }
++    }
++    tsync(P.bar, target);
++
++    // ---- P3: expert down rows in contiguous per-block ranges (<= 2 experts per block), shared down rows ----
++    {
++        const int N3 = U * D;
++        // block ranges split by cost, not rows: a row of union expert u costs 1 + (tokens routed to u) dot products.
++        // Equal-row ranges left a 40 us arrival spread at T = 6. A block's share (total / grid) is always below the cheapest
++        // expert's 2 * D units (U + 8 T < 112), so a range spans at most 2 experts. Ranges are aligned to 4 rows: a warp's
++        // group of 4 rows never spans two experts, so its token mask is uniform.
++        long long C = 0;
++        for (int u = 0; u < U; u++) C += (long long) D * (P3_ROW_COST + 2 * __popc(umaskl[u]));
++        auto row_at = [&](long long c) {
++            long long acc = 0;
++            for (int u = 0; u < U; u++) {
++                const int w = P3_ROW_COST + 2 * __popc(umaskl[u]);
++                if (c < acc + (long long) D * w) return (u * D + (int) ((c - acc) / w)) & ~3;
++                acc += (long long) D * w;
++            }
++            return U * D;
++        };
++        const int r0 = row_at(C * blockIdx.x / gridDim.x);
++        const int r1 = blockIdx.x + 1 == gridDim.x ? N3 : row_at(C * (blockIdx.x + 1) / gridDim.x);
++        const int ulo = r0 / D, uhi = r1 > r0 ? (r1 - 1) / D : ulo;
++        __half * act16 = regA;                      // [2][TM][AS]
++        __half * ash16 = regA + 2 * TM * AS;        // [TM][AS]
++        // swiglu into fp16 (pre-permuted): warps 0..11 = (expert slot, token) pairs, a lane owns 16 contiguous elements
++        // (two lanes per 32-element sub-block); warps 12..15 = shared expert, tokens w-12 and w-8. Loads issued up front.
++        if (warp < 2 * TM) {
++            const int s_ = warp, uu = ulo + s_ / TM, t = s_ % TM;
++            if (uu <= uhi && uu < U && (umaskl[uu] & (1 << t))) {
++                const float * gu = P.egu + ((size_t) uu * TM + t) * 2 * FF + 16 * lane;
++                float4 g4[4], u4[4];
++#pragma unroll
++                for (int i = 0; i < 4; i++) { g4[i] = __ldcg((const float4 *) gu + i); u4[i] = __ldcg((const float4 *) (gu + FF) + i); }
++                float sum = 0.f;
++#pragma unroll
++                for (int i = 0; i < 4; i++) {
++                    const float g[4] = {g4[i].x, g4[i].y, g4[i].z, g4[i].w}, u_[4] = {u4[i].x, u4[i].y, u4[i].z, u4[i].w};
++#pragma unroll
++                    for (int c = 0; c < 4; c++) {
++                        const __half h = __float2half(silu(g[c]) * u_[c]);
++                        act16[s_ * AS + pp(16 * lane + 4 * i + c)] = h;
++                        sum += __half2float(h);
++                    }
++                }
++                sum += __shfl_xor_sync(0xffffffff, sum, 1);
++                if ((lane & 1) == 0) asum[s_ * 16 + (lane >> 1)] = sum;
++            }
++        } else {
++            for (int t = warp - 2 * TM; t < T; t += NW - 2 * TM) {
++                const float * gu = P.shgu + t * 2 * FF + 16 * lane;
++                float4 g4[4], u4[4];
++#pragma unroll
++                for (int i = 0; i < 4; i++) { g4[i] = __ldcg((const float4 *) gu + i); u4[i] = __ldcg((const float4 *) (gu + FF) + i); }
++#pragma unroll
++                for (int i = 0; i < 4; i++) {
++                    const float g[4] = {g4[i].x, g4[i].y, g4[i].z, g4[i].w}, u_[4] = {u4[i].x, u4[i].y, u4[i].z, u4[i].w};
++#pragma unroll
++                    for (int c = 0; c < 4; c++) ash16[t * AS + pp(16 * lane + 4 * i + c)] = __float2half(silu(g[c]) * u_[c]);
++                }
++            }
++        }
++        __syncthreads();
++        // groups of 4 rows per warp: lane = row in group * 8 + superblock * 4 + chunk
++        const int sb = (lane >> 2) & 1, q = lane & 3, ri = lane >> 3;
++        auto q5at = [&](int g) { return load_q5k(W.down + ((size_t) ulist[g / D] * D + g % D + ri) * Q5K_ROW + sb * 176, q); };
++        int g0 = r0 + 4 * warp;
++        q5_ld Lc;
++        if (g0 < r1) Lc = q5at(g0);
++        for (; g0 < r1; g0 += 4 * NW) {
++            q5_ld Ln;
++            if (g0 + 4 * NW < r1) Ln = q5at(g0 + 4 * NW); // next group's loads in flight during this group's math
++            const int u = g0 / D, r = g0 % D + ri;
++            w64 w;
++            prep_q5k(Lc, q, w);
++            Lc = Ln;
++            const int base = sb * 256 + 64 * q, j0 = base >> 5;
++            const __half * a16 = act16 + (u - ulo) * TM * AS;
++            const float * as = asum + (u - ulo) * TM * 16;
++            for (unsigned m = umaskl[u]; m; m &= m - 1) {
++                const int t = __ffs(m) - 1;
++                float a = dot1(w, a16 + t * AS, base, as[t * 16 + j0], as[t * 16 + j0 + 1]);
++                a += __shfl_xor_sync(0xffffffff, a, 4); a += __shfl_xor_sync(0xffffffff, a, 2); a += __shfl_xor_sync(0xffffffff, a, 1);
++                if ((lane & 7) == 0) {
++                    const int k = kof[u][t];
++                    P.ypart[((size_t) t * NU + k) * D + r] = selw[t][k] * a;
++                }
++            }
++        }
++        // shared down: pairs of q8_0 rows (K = 512) for all tokens
++        for (int u = gw; u < D / 2; u += nwg) {
++            stage_row(stage[warp], W.sd + (size_t) 2 * u * Q8_ROW_F, 2 * Q8_ROW_F, lane);
++            const int sub = lane >> 4, blk = lane & 15;
++            float acc[TM];
++#pragma unroll
++            for (int t = 0; t < TM; t++) acc[t] = 0.f;
++            dot_q8h_T(stage[warp] + sub * Q8_ROW_F, blk, blk, ash16, AS, T, acc);
++            __syncwarp();
++#pragma unroll
++            for (int t = 0; t < TM; t++) {
++                float a = acc[t];
++                for (int o = 8; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o);
++                if (t < T && blk == 0) P.shout[t * D + 2 * u + sub] = a;
++            }
++        }
++    }
++    tsync(P.bar, target);
++
++    // ---- P4: combine ----
++    for (int idx = blockIdx.x * NT + threadIdx.x; idx < T * D; idx += gridDim.x * NT) {
++        const int t = idx / D, r = idx % D;
++        float y = 0.f;
++#pragma unroll
++        for (int k = 0; k < NU; k++) y += __ldcg(P.ypart + ((size_t) t * NU + k) * D + r);
++        P.x_out[idx] = P.x_in[idx] + (y + sgv[t] * __ldcg(P.shout + idx));
++    }
++    __syncthreads();
++}
++
++} // namespace moe
++
++// ================= gated delta net half =================
++namespace gdn {
++using namespace mt;
++
++constexpr int D = 2048;
++constexpr int HK = 16, HV = 32, SD = 128, QKV = 2 * HK * SD + HV * SD, VD = HV * SD;
++constexpr int Q8_ROW_D = D / 32 * 34, Q8_ROW_V = VD / 32 * 34, HALF = 1088;
++constexpr int XS = D + D / 16;                         // padded fp16 row (also one K half of ssm_out's input)
++
++struct Layer {
++    const float * norm; const uint8_t * qkv; const uint8_t * z; const float * alpha; const float * beta;
++    const float * dt; const float * a; const float * conv; const float * snorm; const uint8_t * out;
++};
++struct Params {
++    Layer L;
++    const float * x_in; float * x_out;
++    float eps_norm, eps_l2, scale_l2, eps_gn;
++    int KS;                                 // snapshot slots (n_rs_seq + 1)
++    const float * cs_base; const int32_t * cs_ids; int64_t cs_row; // conv state [QKV][3] read from row cs_ids[0]
++    const float * ss_base; const int32_t * ss_ids; int64_t ss_row; // recurrent state [HV][SD][SD], row ss_ids[0]
++    float * cs_snap; int64_t cs_slot;       // snapshot slot s at cs_snap + s * cs_slot
++    float * ss_snap; int64_t ss_slot;
++    float * qkvc; float * zv; float * gb; float * o; float * y;
++    unsigned * bar; unsigned base;
++};
++
++template <int T>
++__global__ void __launch_bounds__(NT, 1) gdn_t_kernel(const Params P) {
++    __shared__ __align__(16) __half xs16[TM * XS];     // G0-G1: normed x; G3: gated-normed half of o
++    __shared__ __align__(16) uint8_t stage[NW][HALF];
++    const Layer & W = P.L;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
++    unsigned target = P.base;
++    const float * cs_in = P.cs_base + (int64_t) P.cs_ids[0] * P.cs_row;
++    const float * ss_in = P.ss_base + (int64_t) P.ss_ids[0] * P.ss_row;
++
++    norm_T<D, XS>(P.x_in, W.norm, P.eps_norm, T, xs16, nullptr);
++
++    // ---- G1: alpha / beta rows (f32), then qkv + z rows (q8_0 stream) ----
++    constexpr int NAB = 2 * HV, N1 = NAB + QKV + VD;
++    if (gw < NAB) {
++        const int h = gw % HV;
++        const float * w = (gw < HV ? W.alpha : W.beta) + (size_t) h * D;
++        float acc[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) acc[t] = 0.f;
++#pragma unroll 4
++        for (int i = 0; i < D / 128; i++) {
++            const float4 v = __ldg((const float4 *) (w + 128 * i) + lane);
++#pragma unroll
++            for (int t = 0; t < TM; t++) if (t < T) acc[t] += dot4(v, ld4h(xs16 + t * XS + px(128 * i + 4 * lane)));
++        }
++#pragma unroll
++        for (int t = 0; t < TM; t++) {
++            const float a = wsum(acc[t]);
++            if (lane == 0 && t < T) {
++                if (gw < HV) { const float xb = a + __ldg(W.dt + h); P.gb[(t * 2 + 0) * HV + h] = (xb > 20.f ? xb : logf(1.f + expf(xb))) * __ldg(W.a + h); }
++                else P.gb[(t * 2 + 1) * HV + h] = 1.f / (1.f + expf(-a));
++            }
++        }
++    }
++    {
++        const int u0 = gw < NAB ? gw + nwg : gw;
++        const int nt = u0 < N1 ? 2 * ((N1 - u0 + nwg - 1) / nwg) : 0;
++        auto rowp = [&](int u) { const int r = u - NAB; return r < QKV ? W.qkv + (size_t) r * Q8_ROW_D : W.z + (size_t) (r - QKV) * Q8_ROW_D; };
++        auto ld = [&](int c, int4 * bb) {
++            const int4 * p = (const int4 *) (rowp(u0 + (c >> 1) * nwg) + (c & 1) * HALF);
++            bb[0] = __ldg(p + lane); bb[1] = __ldg(p + 32 + lane); if (lane < 4) bb[2] = __ldg(p + 64 + lane);
++        };
++        int4 b0[3], b1[3];
++        if (nt > 0) ld(0, b0);
++        if (nt > 1) ld(1, b1);
++        float acc[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) acc[t] = 0.f;
++        float cw[4] = {0, 0, 0, 0}, cs[3] = {0, 0, 0};
++        for (int c = 0; c < nt; c++) {
++            const int r = u0 + (c >> 1) * nwg - NAB;
++            if ((c & 1) == 0 && r < QKV) { // epilogue inputs issued at row start (same address in all lanes: one load)
++                const float4 w4 = __ldg((const float4 *) (W.conv + 4 * r));
++                cw[0] = w4.x; cw[1] = w4.y; cw[2] = w4.z; cw[3] = w4.w;
++                cs[0] = cs_in[3 * r]; cs[1] = cs_in[3 * r + 1]; cs[2] = cs_in[3 * r + 2];
++            }
++            int4 * st = (int4 *) stage[warp];
++            st[lane] = b0[0]; st[32 + lane] = b0[1]; if (lane < 4) st[64 + lane] = b0[2];
++            __syncwarp();
++            b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++            if (c + 2 < nt) ld(c + 2, b1);
++            dot_q8h<T>(stage[warp], lane, 32 * (c & 1) + lane, xs16, XS, acc);
++            __syncwarp();
++            if (c & 1) {
++                float a[TM];
++#pragma unroll
++                for (int t = 0; t < TM; t++) { a[t] = wsum(acc[t]); acc[t] = 0.f; }
++                if (r < QKV) {
++                    // conv window in = [s0 s1 s2 a0 .. aT-1] spread over lanes (lane q holds in[q]), then
++                    // lane t < T computes token t's conv output and lanes 0..3*KS-1 write one snapshot value each
++                    float my = 0.f;
++#pragma unroll
++                    for (int q = 0; q < 3; q++) if (lane == q) my = cs[q];
++#pragma unroll
++                    for (int t = 0; t < TM; t++) if (lane == 3 + t) my = a[t];
++                    const float i0 = __shfl_sync(0xffffffff, my, lane), i1 = __shfl_sync(0xffffffff, my, lane + 1);
++                    const float i2 = __shfl_sync(0xffffffff, my, lane + 2), i3 = __shfl_sync(0xffffffff, my, lane + 3);
++                    if (lane < T) P.qkvc[(size_t) lane * QKV + r] = silu(cw[0] * i0 + cw[1] * i1 + cw[2] * i2 + cw[3] * i3);
++                    const int slot = lane / 3, m = lane % 3;              // slot = KS - j, window start max(0, T - slot)
++                    const float sv = __shfl_sync(0xffffffff, my, max(0, T - slot) + m);
++                    if (lane < 3 * P.KS) P.cs_snap[slot * P.cs_slot + 3 * r + m] = sv;
++                } else if (lane == 0) {
++#pragma unroll
++                    for (int t = 0; t < TM; t++) if (t < T) P.zv[(size_t) t * VD + r - QKV] = a[t];
++                }
++            }
++        }
++    }
++    tsync(P.bar, target);
++
++    // ---- G2: recurrence over the T tokens per (v head, column); lane holds state rows i = lane + 32 r ----
++    for (int u = gw; u < HV * SD; u += nwg) {
++        const int h = u / SD, col = u % SD, kh = h % HK;
++        const size_t off = (size_t) h * SD * SD + (size_t) col * SD;
++        float s[4];
++#pragma unroll
++        for (int r = 0; r < 4; r++) s[r] = ss_in[off + 32 * r + lane];
++        // all tokens' inputs issued up front (a load-use chain per token would pay T L2 round trips)
++        float q[TM][4], k[TM][4], vv[TM], gg[TM], be[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) {
++            if (t < T) {
++#pragma unroll
++                for (int r = 0; r < 4; r++) {
++                    q[t][r] = __ldcg(P.qkvc + (size_t) t * QKV + kh * SD + 32 * r + lane);
++                    k[t][r] = __ldcg(P.qkvc + (size_t) t * QKV + HK * SD + kh * SD + 32 * r + lane);
++                }
++                vv[t] = __ldcg(P.qkvc + (size_t) t * QKV + 2 * HK * SD + h * SD + col);
++                gg[t] = __ldcg(P.gb + (t * 2 + 0) * HV + h);
++                be[t] = __ldcg(P.gb + (t * 2 + 1) * HV + h);
++            }
++        }
++#pragma unroll
++        for (int t = 0; t < TM; t++) {
++            if (t < T) {
++                const float iq = rsqrtf(wsum(q[t][0] * q[t][0] + q[t][1] * q[t][1] + q[t][2] * q[t][2] + q[t][3] * q[t][3]) / SD + P.eps_l2) * P.scale_l2;
++                const float ik = rsqrtf(wsum(k[t][0] * k[t][0] + k[t][1] * k[t][1] + k[t][2] * k[t][2] + k[t][3] * k[t][3]) / SD + P.eps_l2) * P.scale_l2;
++                const float g = expf(gg[t]);
++                float kv = 0.f;
++#pragma unroll
++                for (int r = 0; r < 4; r++) kv += s[r] * k[t][r] * ik;
++                kv = wsum(kv);
++                const float delta = (vv[t] - g * kv) * be[t];
++                float at = 0.f;
++#pragma unroll
++                for (int r = 0; r < 4; r++) { s[r] = g * s[r] + k[t][r] * ik * delta; at += s[r] * q[t][r] * iq; }
++                at = wsum(at);
++                if (lane == 0) P.o[(size_t) t * VD + h * SD + col] = at * rsqrtf((float) SD);
++                const int slot = T - 1 - t;
++                if (slot < P.KS) {
++#pragma unroll
++                    for (int r = 0; r < 4; r++) P.ss_snap[slot * P.ss_slot + off + 32 * r + lane] = s[r];
++                }
++            }
++        }
++    }
++    tsync(P.bar, target);
++
++    // ---- G3: blocks split into two K halves; gated norm of the half's 16 heads per token, then ssm_out rows ----
++    {
++        const int half = blockIdx.x & 1, nbh = gridDim.x >> 1, bh = blockIdx.x >> 1;
++        __half * on16 = xs16; // [TM][XS], element e of the half = head (16 * half + e / 128), lane i = e % 128
++        for (int p = warp; p < T * 16; p += NW) {
++            const int t = p / 16, h = 16 * half + p % 16;
++            float v[4], z[4], ssq = 0.f;
++#pragma unroll
++            for (int r = 0; r < 4; r++) {
++                v[r] = __ldcg(P.o + (size_t) t * VD + h * SD + 32 * r + lane);
++                z[r] = __ldcg(P.zv + (size_t) t * VD + h * SD + 32 * r + lane);
++                ssq += v[r] * v[r];
++            }
++            const float inv = rsqrtf(wsum(ssq) / SD + P.eps_gn);
++#pragma unroll
++            for (int r = 0; r < 4; r++) {
++                const int i = 32 * r + lane;
++                on16[t * XS + pp((p % 16) * SD + i)] = __float2half(v[r] * inv * __ldg(W.snorm + i) * silu(z[r]));
++            }
++        }
++        __syncthreads();
++        const int gwh = warp * nbh + bh, nwh = NW * nbh;
++        const int nt = gwh < D ? 2 * ((D - gwh + nwh - 1) / nwh) : 0;
++        auto ld = [&](int c, int4 * bb) {
++            const int4 * p = (const int4 *) (W.out + (size_t) (gwh + (c >> 1) * nwh) * Q8_ROW_V + half * 2 * HALF + (c & 1) * HALF);
++            bb[0] = __ldg(p + lane); bb[1] = __ldg(p + 32 + lane); if (lane < 4) bb[2] = __ldg(p + 64 + lane);
++        };
++        int4 b0[3], b1[3];
++        if (nt > 0) ld(0, b0);
++        if (nt > 1) ld(1, b1);
++        float acc[TM];
++#pragma unroll
++        for (int t = 0; t < TM; t++) acc[t] = 0.f;
++        for (int c = 0; c < nt; c++) {
++            int4 * st = (int4 *) stage[warp];
++            st[lane] = b0[0]; st[32 + lane] = b0[1]; if (lane < 4) st[64 + lane] = b0[2];
++            __syncwarp();
++            b0[0] = b1[0]; b0[1] = b1[1]; b0[2] = b1[2];
++            if (c + 2 < nt) ld(c + 2, b1);
++            dot_q8h<T>(stage[warp], lane, 32 * (c & 1) + lane, on16, XS, acc);
++            __syncwarp();
++            if (c & 1) {
++                const int r = gwh + (c >> 1) * nwh;
++#pragma unroll
++                for (int t = 0; t < TM; t++) { const float a = wsum(acc[t]); acc[t] = 0.f; if (lane == 0 && t < T) P.y[((size_t) half * TM + t) * D + r] = a; }
++            }
++        }
++    }
++    tsync(P.bar, target);
++    // ---- G4: combine ----
++    for (int i = blockIdx.x * NT + threadIdx.x; i < T * D; i += gridDim.x * NT) {
++        const int t = i / D, r = i % D;
++        P.x_out[i] = P.x_in[i] + (__ldcg(P.y + (size_t) t * D + r) + __ldcg(P.y + ((size_t) TM + t) * D + r));
++    }
++}
++
++} // namespace gdn
++
++
++unsigned * mega_bar(ggml_backend_cuda_context & ctx) {
++    if (ctx.p60_mega_bar == nullptr) {
++        CUDA_CHECK(cudaMalloc(&ctx.p60_mega_bar, sizeof(unsigned)));
++        CUDA_CHECK(cudaMemset(ctx.p60_mega_bar, 0, sizeof(unsigned)));
++        ctx.p60_mega_epoch = 0;
++    }
++    return ctx.p60_mega_bar;
++}
++
++template <typename KP>
++void mega_launch(ggml_backend_cuda_context & ctx, const void * kernel, KP & kp, int n_barriers) {
++    const int nblk = ggml_cuda_info().devices[ctx.device].nsm;
++    kp.bar  = mega_bar(ctx);
++    kp.base = ctx.p60_mega_epoch;
++    void * args[] = { &kp };
++    CUDA_CHECK(cudaLaunchCooperativeKernel(kernel, dim3(nblk), dim3(mt::NT), args, 0, ctx.stream()));
++    ctx.p60_mega_epoch += (unsigned) (n_barriers * nblk);
++}
++
++} // namespace
++
++void ggml_cuda_p60_mega_moe_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args, int n_tokens) {
++    using namespace moe;
++    GGML_ASSERT(n_tokens >= 1 && n_tokens <= TM);
++    const size_t n_logits = (TM * (NE + 1) + 3) & ~3, // float4 alignment of what follows
++                  n_shgu = TM * 2 * FF, n_egu = (size_t) MAXU * TM * 2 * FF, n_shout = TM * D;
++    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_logits + n_shgu + n_egu + n_shout + (size_t) TM * NU * D);
++    Params kp = {};
++    kp.L = { args.norm, args.router, args.sgate, (const uint8_t *) args.gate, (const uint8_t *) args.up, (const uint8_t *) args.down,
++             (const uint8_t *) args.sg, (const uint8_t *) args.su, (const uint8_t *) args.sd };
++    kp.x_in   = args.x_in;
++    kp.x_out  = args.x_out;
++    kp.eps    = args.eps;
++    kp.logits = scratch.get();
++    kp.shgu   = kp.logits + n_logits;
++    kp.egu    = kp.shgu + n_shgu;
++    kp.shout  = kp.egu + n_egu;
++    kp.ypart  = kp.shout + n_shout;
++    static const void * const kern[TM] = { (const void *) moe_t_kernel<1>, (const void *) moe_t_kernel<2>, (const void *) moe_t_kernel<3>,
++                                           (const void *) moe_t_kernel<4>, (const void *) moe_t_kernel<5>, (const void *) moe_t_kernel<6> };
++    mega_launch(ctx, kern[n_tokens - 1], kp, 3);
++}
++
++void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args, int n_tokens, int n_snap,
++        int64_t cs_slot, int64_t ss_slot) {
++    using namespace gdn;
++    GGML_ASSERT(n_tokens >= 1 && n_tokens <= TM && n_snap >= 1 && n_snap <= TM);
++    const size_t n_qkvc = (size_t) TM * QKV, n_zv = (size_t) TM * VD, n_gb = TM * 2 * HV, n_o = (size_t) TM * VD;
++    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n_qkvc + n_zv + n_gb + n_o + 2 * TM * D);
++    Params kp = {};
++    kp.L = { args.attn_norm, (const uint8_t *) args.qkv, (const uint8_t *) args.z, args.alpha, args.beta, args.dt, args.a, args.conv,
++             args.snorm, (const uint8_t *) args.out };
++    kp.x_in     = args.x_in;
++    kp.x_out    = args.x_out;
++    kp.eps_norm = args.eps_norm;
++    kp.eps_l2   = args.eps_l2;
++    kp.scale_l2 = args.scale_l2;
++    kp.eps_gn   = args.eps_gn;
++    kp.KS       = n_snap;
++    kp.cs_base  = args.cs_base; kp.cs_ids = args.cs_ids; kp.cs_row = args.cs_row;
++    kp.ss_base  = args.ss_base; kp.ss_ids = args.ss_ids; kp.ss_row = args.ss_row;
++    kp.cs_snap  = args.cs_out;  kp.cs_slot = cs_slot;
++    kp.ss_snap  = args.ss_out;  kp.ss_slot = ss_slot;
++    kp.qkvc = scratch.get();
++    kp.zv   = kp.qkvc + n_qkvc;
++    kp.gb   = kp.zv + n_zv;
++    kp.o    = kp.gb + n_gb;
++    kp.y    = kp.o + n_o;
++    static const void * const kern[TM] = { (const void *) gdn_t_kernel<1>, (const void *) gdn_t_kernel<2>, (const void *) gdn_t_kernel<3>,
++                                           (const void *) gdn_t_kernel<4>, (const void *) gdn_t_kernel<5>, (const void *) gdn_t_kernel<6> };
++    mega_launch(ctx, kern[n_tokens - 1], kp, 3);
++}
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+index 1225e445f..2e2c6c16c 100644
+--- a/ggml/src/ggml-cuda/p60-mega.cuh
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -54,3 +54,10 @@ struct ggml_cuda_p60_mega_moe_args {
+ 
+ void ggml_cuda_p60_mega_gdn(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args);
+ void ggml_cuda_p60_mega_moe(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args);
++
++// multi-token versions (p60-mega-t.cu, n_tokens <= 6, MTP verify): x_in / x_out hold n_tokens rows. fp16 activations
++// with HFMA2 products. The gdn version keeps n_snap recurrent-state snapshots (n_rs_seq + 1) as llama.cpp does for
++// rollback: cs_out / ss_out point at slot 0, slot s is cs_slot / ss_slot floats further.
++void ggml_cuda_p60_mega_moe_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_moe_args & args, int n_tokens);
++void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args, int n_tokens, int n_snap,
++        int64_t cs_slot, int64_t ss_slot);
+-- 
+2.56.0
+

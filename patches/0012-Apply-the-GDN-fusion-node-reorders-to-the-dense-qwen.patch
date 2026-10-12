@@ -1,0 +1,65 @@
+From 2f92486e812faf43df58ba6512430051d46b28f2 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:07:58 -0400
+Subject: [PATCH 12/31] Apply the GDN fusion node reorders to the dense qwen35
+ graph
+
+The gated-norm and conv-state fusions only fire when their nodes are adjacent,
+which qwen35moe arranges with two ggml_build_forward_expand calls (gate
+projection before the gated norm; conv and silu right after the conv-state
+update). The dense qwen35 graph (Qwen3.8-27B) builds the same layers but never
+got those calls, so neither fusion matched. Same two calls here, node order
+only.
+
+Qwen3.8-27B UD-Q4_K_M, 2x P100, GGML_CUDA_P60_MMVQ=1: 1770 -> 1578 kernels
+per token, llama-bench tg128 17.95 -> 18.15 t/s (+1.1%, two interleaved
+rounds). Wikitext KLD at ub=1 vs the previous build: 0, same top 100%
+(max 0.000054, the stored-logit floor); ub=512 PPL identical to all digits.
+
+Assisted-by: Claude Opus 5.5
+---
+ src/models/qwen35.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index a1e263500..55aa4d366 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -245,6 +245,9 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
+         ggml_tensor * weights,
+         ggml_tensor * gate,
+         int           layer) {
++    // schedule the gate's projection first so the norm, its weight, the silu and the gating multiply are adjacent
++    // nodes that the backend can fuse; the computation is unchanged
++    ggml_build_forward_expand(gf, gate);
+     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+ 
+@@ -384,16 +387,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+ 
+-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+-    cb(state, "state_predelta", il);
+-
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+     cb(conv_output_silu, "conv_output_silu", il);
+ 
++    // schedule the conv right after the conv-state update so the state gather, concat, update copy and conv are one
++    // run of nodes that the backend can fuse; the computation is unchanged
++    ggml_build_forward_expand(gf, conv_output_silu);
++
++    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
++    cb(state, "state_predelta", il);
++
+     ggml_tensor * conv_qkv_mix = conv_output_silu;
+ 
+     // Calculate the total conv dimension
+-- 
+2.56.0
+

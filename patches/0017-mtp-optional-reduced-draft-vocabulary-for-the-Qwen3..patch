@@ -1,0 +1,283 @@
+From a23432a5298cce1e7f8809a12aeaf95522902c50 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:37:20 -0400
+Subject: [PATCH 17/31] mtp : optional reduced draft vocabulary for the
+ Qwen3.5/3.6 MoE draft head
+
+LLAMA_MTP_DRAFT_VOCAB=<file of int32 token ids> makes the MTP draft head compute logits only for
+those tokens plus up to 4096 tokens seen in the current sequence; all other tokens get -inf.
+The rows are copied from the LM head at load time into a buffer next to it (32k list: 78 MiB).
+The target model and verification are unchanged, so it only changes which tokens are drafted.
+
+On 2x P100 the draft head's full 248k-row LM head matvec was ~930 us per draft step (11% of
+MTP decode). 35B UD-Q4_K_XL, 8-prompt MTP bench, 2 reps each:
+  greedy:            113.3 -> 121.4 t/s (+7.1%), acceptance 0.830 -> 0.782
+  production sampler 108.7 -> 115.6 t/s (+6.3%)
+16k/48k/64k lists: 117.2 / 120.3 / 119.2 t/s. Without the sequence tokens 32k gave only +3.8%.
+Greedy text moves the same way MTP already does vs no-spec (batch-shape rounding): mean chars
+matching no-spec 445 (base) vs 422 (this), per prompt both earlier and later.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/speculative.cpp   |   3 +
+ src/llama-context.cpp    |   4 ++
+ src/llama-ext.h          |   3 +
+ src/llama-model.cpp      | 141 +++++++++++++++++++++++++++++++++++++++
+ src/llama-model.h        |  11 +++
+ src/models/qwen35moe.cpp |  13 +++-
+ 6 files changed, 174 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535..3590e1dd3 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1493,6 +1493,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const int32_t n_tokens = batch_in.n_tokens;
+ 
++        // tokens of the sequence join the draft vocabulary (no-op when it is off)
++        llama_mtp_draft_vocab_add(llama_get_model(this->params.ctx_dft), batch_in.token, n_tokens);
++
+         // remember the first and last batch index for each sequence
+         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ef53728d1..4ac478ec0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3918,6 +3918,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+     return ctx->get_embeddings_seq(seq_id);
+ }
+ 
++void llama_mtp_draft_vocab_add(const llama_model * model, const llama_token * tokens, int32_t n_tokens) {
++    model->dv_add_tokens(tokens, n_tokens);
++}
++
+ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
+     ctx->set_embeddings_nextn(value, masked);
+ }
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92a759b7a..2f6936762 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -16,6 +16,9 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+         uint32_t n_seqs,
+         uint32_t n_outputs);
+ 
++// Add tokens of the current sequence to the MTP draft vocabulary (env LLAMA_MTP_DRAFT_VOCAB). No-op when it is off.
++LLAMA_API void llama_mtp_draft_vocab_add(const struct llama_model * model, const llama_token * tokens, int32_t n_tokens);
++
+ // Get the default ggml_type for a given ftype.
+ LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e195f50d0..78721e481 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1879,9 +1879,150 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    if (const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB"); path && hparams.n_layer_nextn > 0 && output) {
++        load_draft_vocab(path);
++    }
++
+     return true;
+ }
+ 
++// copy the LM head rows of the tokens listed in path (int32 ids) into a new buffer next to the LM head
++void llama_model_base::load_draft_vocab(const char * path) {
++    std::vector<int32_t> ids;
++    {
++        FILE * f = fopen(path, "rb");
++        if (!f) {
++            LLAMA_LOG_WARN("%s: cannot open %s, draft vocabulary off\n", __func__, path);
++            return;
++        }
++        int32_t id;
++        while (fread(&id, sizeof(id), 1, f) == 1) {
++            ids.push_back(id);
++        }
++        fclose(f);
++    }
++    const int64_t n_vocab = output->ne[1];
++    std::vector<int32_t> map(n_vocab, -1);
++    int32_t n_sub = 0;
++    for (int32_t id : ids) {
++        if (id >= 0 && id < n_vocab) {
++            map[id] = 0;
++        }
++    }
++    for (auto & m : map) {
++        if (m == 0) {
++            m = n_sub++;
++        }
++    }
++    if (n_sub == 0) {
++        return;
++    }
++    const int32_t n_extra = 4096; // rows for tokens of the current sequence
++    const int32_t n_rows  = n_sub + n_extra;
++    for (auto & m : map) {
++        if (m < 0) {
++            m = n_rows;
++        }
++    }
++
++    ggml_init_params ip = { 3*ggml_tensor_overhead(), nullptr, true };
++    ggml_context_ptr ctx { ggml_init(ip) };
++    dv_head = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_rows);
++    dv_map  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_vocab);
++    dv_ninf = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 1, 1);
++    ggml_set_name(dv_head, "dv_head");
++    ggml_set_name(dv_map,  "dv_map");
++    ggml_set_name(dv_ninf, "dv_ninf");
++
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
++    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
++    if (!buf) {
++        LLAMA_LOG_WARN("%s: cannot allocate the draft vocabulary, draft vocabulary off\n", __func__);
++        dv_head = dv_map = dv_ninf = nullptr;
++        return;
++    }
++    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    // gather rows in chunks to keep host memory small; rows are sorted, so the subset fills in order
++    const size_t row_size = output->nb[1];
++    const int64_t chunk = 4096;
++    std::vector<uint8_t> src(row_size * chunk);
++    std::vector<uint8_t> dst((size_t) n_rows * row_size, 0);
++    for (int64_t r0 = 0; r0 < n_vocab; r0 += chunk) {
++        const int64_t nr = std::min<int64_t>(chunk, n_vocab - r0);
++        ggml_backend_tensor_get(output, src.data(), r0*row_size, nr*row_size);
++        for (int64_t r = r0; r < r0 + nr; ++r) {
++            if (map[r] < n_rows) {
++                memcpy(dst.data() + (size_t) map[r]*row_size, src.data() + (r - r0)*row_size, row_size);
++            }
++        }
++    }
++    ggml_backend_tensor_set(dv_head, dst.data(), 0, dst.size());
++    ggml_backend_tensor_set(dv_map, map.data(), 0, ggml_nbytes(dv_map));
++    const float ninf = -INFINITY;
++    ggml_backend_tensor_set(dv_ninf, &ninf, 0, sizeof(ninf));
++
++    dv_map_host = std::move(map);
++    dv_n_static = n_sub;
++
++    LLAMA_LOG_INFO("%s: MTP draft vocabulary: %d of %lld tokens, %.1f MiB on %s\n", __func__,
++            n_sub, (long long) n_vocab, ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0, ggml_backend_buffer_name(buf.get()));
++
++    std::vector<ggml_backend_buffer_ptr> bufs;
++    bufs.emplace_back(std::move(buf));
++    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
++}
++
++void llama_model::dv_add_tokens(const int32_t * tokens, int32_t n_tokens) const {
++    if (!dv_head) {
++        return;
++    }
++    const int32_t n_rows  = (int32_t) dv_head->ne[1];
++    const int32_t n_vocab = (int32_t) dv_map_host.size();
++    // extra region full: drop all sequence tokens and start over with this batch
++    if (dv_n_static + dv_n_used + n_tokens > n_rows) {
++        int32_t n_new = 0;
++        for (int32_t i = 0; i < n_tokens; ++i) {
++            n_new += tokens[i] >= 0 && tokens[i] < n_vocab && dv_map_host[tokens[i]] == n_rows;
++        }
++        if (dv_n_static + dv_n_used + n_new > n_rows) {
++            for (auto & m : dv_map_host) {
++                if (m >= dv_n_static && m < n_rows) {
++                    m = n_rows;
++                }
++            }
++            dv_n_used = 0;
++            ggml_backend_tensor_set(dv_map, dv_map_host.data(), 0, ggml_nbytes(dv_map));
++        }
++    }
++    const int32_t i0 = dv_n_static + dv_n_used;
++    std::vector<int32_t> added;
++    for (int32_t i = 0; i < n_tokens && i0 + (int32_t) added.size() < n_rows; ++i) {
++        const int32_t t = tokens[i];
++        if (t >= 0 && t < n_vocab && dv_map_host[t] == n_rows) {
++            dv_map_host[t] = i0 + (int32_t) added.size();
++            added.push_back(t);
++        }
++    }
++    if (added.empty()) {
++        return;
++    }
++    const size_t row_size = output->nb[1];
++    std::vector<uint8_t> rows(added.size() * row_size);
++    for (size_t k = 0; k < added.size(); ++k) {
++        ggml_backend_tensor_get(output, rows.data() + k*row_size, (size_t) added[k]*row_size, row_size);
++    }
++    ggml_backend_tensor_set(dv_head, rows.data(), (size_t) i0*row_size, rows.size());
++    if (added.size() > 64) {
++        ggml_backend_tensor_set(dv_map, dv_map_host.data(), 0, ggml_nbytes(dv_map));
++    } else {
++        for (int32_t t : added) {
++            ggml_backend_tensor_set(dv_map, &dv_map_host[t], (size_t) t*sizeof(int32_t), sizeof(int32_t));
++        }
++    }
++    dv_n_used += (int32_t) added.size();
++}
++
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+     return ml.create_tensor(
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 984b2cf38..ed4f49ddc 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -634,6 +634,16 @@ struct llama_model {
+     struct ggml_tensor * output_b        = nullptr;
+     struct ggml_tensor * output_norm_enc = nullptr;
+ 
++    // MTP draft vocabulary (env LLAMA_MTP_DRAFT_VOCAB): LM head rows of a token subset, only for the draft head
++    struct ggml_tensor * dv_head = nullptr; // output rows of the subset, same type as output
++    struct ggml_tensor * dv_map  = nullptr; // I32 [n_vocab]: index into dv_head, or n_rows (the -inf row) for tokens out of the subset
++    struct ggml_tensor * dv_ninf = nullptr; // F32 [1, 1] = -inf, logit of tokens out of the subset
++    mutable std::vector<int32_t> dv_map_host; // host copy of dv_map
++    mutable int32_t dv_n_used = 0;            // used rows of the extra region at the end of dv_head
++    int32_t dv_n_static = 0;                  // rows from the file; the extra region follows
++
++    // add tokens of the current sequence to the draft vocabulary (extra region, cleared when full)
++    void dv_add_tokens(const int32_t * tokens, int32_t n_tokens) const;
+ 
+     // NVFP4 per-tensor scale2, input_scale for LM head
+     struct ggml_tensor * output_s    = nullptr;
+@@ -821,6 +831,7 @@ struct llama_model_base : public llama_model {
+     void load_hparams(llama_model_loader & ml) override;
+     void load_vocab  (llama_model_loader & ml) override;
+     bool load_tensors(llama_model_loader & ml) override;
++    void load_draft_vocab(const char * path);
+ 
+     // model must define these
+     void load_arch_hparams(llama_model_loader & ml) override = 0;
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index dd8696504..91fc0616f 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -740,7 +740,18 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    if (model.dv_head && head_w == model.output && !head_s && n_outputs > 0) {
++        // draft vocabulary: logits for the subset only, -inf for all other tokens
++        ggml_tensor * sub = build_lora_mm(model.dv_head, cur, nullptr);
++        cb(sub, "mtp_dv_logits", -1);
++        ggml_tensor * pad = ggml_repeat_4d(ctx0, model.dv_ninf, 1, sub->ne[1], 1, 1);
++        sub = ggml_concat(ctx0, sub, pad, 0);
++        sub = ggml_cont(ctx0, ggml_transpose(ctx0, sub));
++        cur = ggml_get_rows(ctx0, sub, model.dv_map);
++        cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+-- 
+2.56.0
+

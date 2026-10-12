@@ -1,0 +1,33 @@
+From f12a0d60ab27f99c5b3330b266c626552ed65cf8 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 12:31:34 -0400
+Subject: [PATCH 25/31] cuda : persistent attention half for the Qwen3.5/3.6
+ MoE MTP draft head on sm_60
+
+The draft head's attention half ends at mtp_attn_residual; accept it as the end node, so each draft step runs the
+attention half as the pre kernel, flash attention and the post kernel instead of ~17 stock kernels. Only draft
+tokens change (the main model verifies every token).
+
+2x P100, Qwen3.6-35B-A3B UD-Q4_K_XL, MTP prod sampler, 8 prompts x 256: 179.2 -> 180.4 t/s.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c1d7a33cf..d681735e9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4153,7 +4153,7 @@ static int p60_try_mega_attn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, i
+     }
+     int e = -1;
+     for (int k = i + 2; k < g->n_nodes && k < i + 60; k++) {
+-        if (g->nodes[k]->op == GGML_OP_ADD && p60_is_node(g->nodes[k], "attn_residual", il)) {
++        if (g->nodes[k]->op == GGML_OP_ADD && (p60_is_node(g->nodes[k], "attn_residual", il) || p60_is_node(g->nodes[k], "mtp_attn_residual", il))) {
+             e = k;
+             break;
+         }
+-- 
+2.56.0
+

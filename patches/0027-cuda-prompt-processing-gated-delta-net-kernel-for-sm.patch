@@ -1,0 +1,213 @@
+From 94906a8607640a4f46ef23b24520817622679d96 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 12:52:37 -0400
+Subject: [PATCH 27/31] cuda : prompt-processing gated delta net kernel for
+ sm_60
+
+The gated delta net kernel walks the tokens one by one with one warp per state column: every warp re-reads the
+token's 128-value q and k vectors and does two 5-step shuffle reductions per token, ~6 ms per 1536-token batch per
+layer. For S_v = 128 without KDA and 32+ tokens (GGML_CUDA_P60_MEGA=1, GGML_CUDA_P60_GDN_CHUNK=0 disables), a new
+kernel gives a warp 4 columns with 8 lanes x 16 rows each: 3-step reductions, q / k read once per 4 columns as
+shared-memory broadcasts. The per-token inputs are staged in shared memory in chunks of 8 tokens with coalesced
+loads, the next chunk in flight. fp32 as before; the row sums are taken in a different order. Snapshot (keep_rs)
+semantics unchanged.
+
+test-backend-ops GATED_DELTA_NET (incl. 32..512 tokens, 32 heads of 128, K = 1 / 6) matches the CPU backend.
+1536 tokens, 32 heads: 18.5 -> 8.7 ms (K 1), 14.3 -> 8.8 ms (K 6).
+2x P100: pp4096 1462 -> 1540 t/s, pp512 860 -> 891 t/s. Wikitext KLD at -ub 512: 0.00442 (0.00446 before).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/gated_delta_net.cu | 169 ++++++++++++++++++++++++++
+ 1 file changed, 169 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 323f6f526..4422a6900 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -182,6 +182,162 @@ gated_delta_net_cuda(const float * q,
+     }
+ }
+ 
++
++// Prompt-processing variant (non-KDA, S_v = 128) of the kernel above. A warp owns 4 state columns, 8 lanes per column
++// with 16 rows each: the per-token reductions take 3 shuffle steps instead of 5, and the q / k values of a token are
++// read once per 4 columns (the 8-lane groups read the same shared-memory addresses: broadcasts). Blocks of 4 warps =
++// 16 columns of one head; the per-token inputs are staged in shared memory in chunks of CH tokens with coalesced loads,
++// the next chunk's loads in flight while the current one is computed. fp32 throughout; the row sums are taken in a
++// different order than in the kernel above.
++template <bool keep_rs_t>
++__global__ void __launch_bounds__(128, 4)
++gated_delta_net_chunk_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
++        const float * curr_state, float * dst, float * state, int64_t H, int64_t n_tokens, int64_t n_seqs,
++        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3,
++        const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_slot_stride, int K,
++        const float * beta_pre, float * beta_sig, const int32_t * s_ids, int64_t s_row) {
++    constexpr int S_v = 128, CH = 8, NC = 16, R = 16; // NC columns per block, R rows per lane
++    __shared__ __align__(16) float sk[2][CH][S_v];
++    __shared__ __align__(16) float sq[2][CH][S_v];
++    __shared__ float svv[2][CH][NC], sg[2][CH], sbt[2][CH];
++    const uint32_t h_idx = blockIdx.x, sequence = blockIdx.y;
++    const int lane = threadIdx.x, wy = threadIdx.y, tid = wy * 32 + lane;
++    const int sub = lane >> 3, r0 = (lane & 7) * R;      // column within the warp, first row of this lane
++    const int cb = wy * 4 + sub;                         // column within the block
++    const int col0 = blockIdx.z * NC, col = col0 + cb;
++    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
++    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
++
++    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
++    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
++    state += state_out_offset;
++    curr_state += (s_ids ? (int64_t) s_ids[sequence] * s_row + h_idx * S_v * S_v : state_in_offset) + col * S_v;
++    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
++
++    float s_shard[R];
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        s_shard[r] = curr_state[r0 + r];
++    }
++
++    float lk[8], lq[8], lv = 0.0f, lgb = 0.0f;
++    static_assert(CH * NC == 128, "one v value per thread");
++    auto load = [&](int t0) {
++#pragma unroll
++        for (int j = 0; j < 8; j++) {
++            const int idx = tid + 128 * j, tt = idx / S_v, i = idx % S_v, t = t0 + tt;
++            const int64_t o = iq3 * sq3 + (int64_t) t * sq2 + iq1 * sq1 + i;
++            lk[j] = t < n_tokens ? k[o] : 0.0f;
++            lq[j] = t < n_tokens ? q[o] : 0.0f;
++        }
++        {
++            const int t = t0 + tid / NC;
++            lv = t < n_tokens ? v[sequence * sv3 + (int64_t) t * sv2 + h_idx * sv1 + col0 + tid % NC] : 0.0f;
++        }
++        if (tid < 2 * CH) {
++            const int t = t0 + tid % CH;
++            const int64_t gb_offset = sequence * sb3 + (int64_t) t * sb2 + h_idx * sb1;
++            lgb = 0.0f;
++            if (t < n_tokens) {
++                if (tid < CH) {
++                    lgb = expf(g[gb_offset]);
++                } else if (beta_sig != nullptr) {
++                    // the expression must stay identical to op_sigmoid in unary.cu
++                    lgb = 1.0f / (1.0f + expf(-beta_pre[gb_offset]));
++                    if (blockIdx.z == 0) {
++                        beta_sig[gb_offset] = lgb;
++                    }
++                } else {
++                    lgb = beta[gb_offset];
++                }
++            }
++        }
++    };
++    auto store = [&](int b) {
++#pragma unroll
++        for (int j = 0; j < 8; j++) {
++            const int idx = tid + 128 * j;
++            sk[b][idx / S_v][idx % S_v] = lk[j];
++            sq[b][idx / S_v][idx % S_v] = lq[j];
++        }
++        svv[b][tid / NC][tid % NC] = lv;
++        if (tid < CH) {
++            sg[b][tid] = lgb;
++        } else if (tid < 2 * CH) {
++            sbt[b][tid - CH] = lgb;
++        }
++    };
++    auto red8 = [](float x) {
++        x += __shfl_xor_sync(0xffffffff, x, 4);
++        x += __shfl_xor_sync(0xffffffff, x, 2);
++        x += __shfl_xor_sync(0xffffffff, x, 1);
++        return x;
++    };
++
++    ggml_cuda_pdl_sync();
++    load(0);
++    store(0);
++    __syncthreads();
++    for (int t0 = 0, b = 0; t0 < n_tokens; t0 += CH, b ^= 1) {
++        if (t0 + CH < n_tokens) {
++            load(t0 + CH);
++        }
++        const int nt = n_tokens - t0 < CH ? (int) (n_tokens - t0) : CH;
++        for (int tt = 0; tt < nt; tt++) {
++            const int t = t0 + tt;
++            float k_reg[R], q_reg[R];
++#pragma unroll
++            for (int r = 0; r < R; r += 4) {
++                const float4 kk = *(const float4 *) &sk[b][tt][r0 + r];
++                const float4 qq = *(const float4 *) &sq[b][tt][r0 + r];
++                k_reg[r] = kk.x; k_reg[r + 1] = kk.y; k_reg[r + 2] = kk.z; k_reg[r + 3] = kk.w;
++                q_reg[r] = qq.x; q_reg[r + 1] = qq.y; q_reg[r + 2] = qq.z; q_reg[r + 3] = qq.w;
++            }
++            const float g_val = sg[b][tt], beta_val = sbt[b][tt];
++            float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
++#pragma unroll
++            for (int r = 0; r < R; r += 4) {
++                kv0 += s_shard[r] * k_reg[r]; kv1 += s_shard[r + 1] * k_reg[r + 1];
++                kv2 += s_shard[r + 2] * k_reg[r + 2]; kv3 += s_shard[r + 3] * k_reg[r + 3];
++            }
++            const float kv_col = red8((kv0 + kv1) + (kv2 + kv3));
++            const float delta_col = (svv[b][tt][cb] - g_val * kv_col) * beta_val;
++            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
++#pragma unroll
++            for (int r = 0; r < R; r += 4) {
++                s_shard[r]     = g_val * s_shard[r]     + k_reg[r]     * delta_col; a0 += s_shard[r]     * q_reg[r];
++                s_shard[r + 1] = g_val * s_shard[r + 1] + k_reg[r + 1] * delta_col; a1 += s_shard[r + 1] * q_reg[r + 1];
++                s_shard[r + 2] = g_val * s_shard[r + 2] + k_reg[r + 2] * delta_col; a2 += s_shard[r + 2] * q_reg[r + 2];
++                s_shard[r + 3] = g_val * s_shard[r + 3] + k_reg[r + 3] * delta_col; a3 += s_shard[r + 3] * q_reg[r + 3];
++            }
++            const float attn_col = red8((a0 + a1) + (a2 + a3));
++            if ((lane & 7) == 0) {
++                attn_data[(int64_t) t * S_v * H + col] = attn_col * scale;
++            }
++            if constexpr (keep_rs_t) {
++                const int target_slot = (int) n_tokens - 1 - t;
++                if (target_slot >= 0 && target_slot < K) {
++                    float * cs = state + target_slot * state_slot_stride + col * S_v + r0;
++#pragma unroll
++                    for (int r = 0; r < R; r++) {
++                        cs[r] = s_shard[r];
++                    }
++                }
++            }
++        }
++        if (t0 + CH < n_tokens) {
++            store(b ^ 1);
++        }
++        __syncthreads();
++    }
++    if constexpr (!keep_rs_t) {
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            state[col * S_v + r0 + r] = s_shard[r];
++        }
++    }
++}
++
+ template <bool KDA, bool keep_rs_t>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+@@ -203,6 +359,19 @@ static void launch_gated_delta_net(
+     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+     const uint3 rq3_magic   = init_fastdiv_values(rq3);
+ 
++    // prompt processing on sm_60 (GGML_CUDA_P60_MEGA=1, GGML_CUDA_P60_GDN_CHUNK=0 disables): inputs staged per chunk
++    static const bool p60_chunk = getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0 &&
++        (getenv("GGML_CUDA_P60_GDN_CHUNK") == nullptr || atoi(getenv("GGML_CUDA_P60_GDN_CHUNK")) != 0);
++    if constexpr (!KDA) {
++        if (p60_chunk && S_v == 128 && n_tokens >= 32 && warp_size == 32 &&
++                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 600) {
++            gated_delta_net_chunk_cuda<keep_rs_t><<<dim3(H, n_seqs, S_v / 16), dim3(32, 4), 0, stream>>>(
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_pre_d, beta_sig_d, s_ids, s_row);
++            return;
++        }
++    }
++
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+     switch (S_v) {
+         case 16:
+-- 
+2.56.0
+

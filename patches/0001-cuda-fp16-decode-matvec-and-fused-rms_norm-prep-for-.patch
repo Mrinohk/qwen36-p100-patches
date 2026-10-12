@@ -1,0 +1,857 @@
+From 529db50550a8737d074c24a7bb3f0c0bfd7aedfd Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 00:05:21 -0400
+Subject: [PATCH 01/31] cuda : fp16 decode matvec and fused rms_norm prep for
+ sm_60
+
+Opt-in with GGML_CUDA_P60_MMVQ=1. Q4_K, Q5_K and Q8_0 matvec for GPUs
+without dp4a, using half2 math. The fused RMS norm writes the fp16
+activation layout so the matvecs skip a separate prep kernel.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/common.cuh   |  20 ++
+ ggml/src/ggml-cuda/mmvq-p60.cu  | 616 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq-p60.cuh |  13 +
+ ggml/src/ggml-cuda/mmvq.cu      |   5 +
+ ggml/src/ggml-cuda/norm.cu      |   5 +
+ tests/test-backend-ops.cpp      |  87 +++++
+ 6 files changed, 746 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/mmvq-p60.cu
+ create mode 100644 ggml/src/ggml-cuda/mmvq-p60.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 31293a1ce..5fb58497e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1487,12 +1487,27 @@ struct ggml_backend_cuda_context {
+     size_t              q8_1_cache_size   = 0;
+     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+ 
++    // Same idea for the fp16 activations of mmvq-p60 (sm_60 single-token matvec): one slot, keyed
++    // on the src1 tensor, its data pointer, stream and channel count; same lifetime rules.
++    char *              p60_x_cache_mem    = nullptr;
++    size_t              p60_x_cache_cap    = 0;
++    const ggml_tensor * p60_x_cache_src1   = nullptr;
++    const void *        p60_x_cache_data   = nullptr;
++    cudaStream_t        p60_x_cache_stream = nullptr;
++    int64_t             p60_x_cache_nch    = 0;
++    int64_t             p60_x_cache_s[2]   = { 0, 0 };
++
+     // Forget the key, keep the buffer.  Called at the top of every graph computation.
+     void q8_1_cache_clear() {
+         q8_1_cache_src1   = nullptr;
+         q8_1_cache_data   = nullptr;
+         q8_1_cache_stream = nullptr;
+         q8_1_cache_size   = 0;
++
++        p60_x_cache_src1   = nullptr;
++        p60_x_cache_data   = nullptr;
++        p60_x_cache_stream = nullptr;
++        p60_x_cache_nch    = 0;
+     }
+ 
+     void q8_1_cache_free() {
+@@ -1501,6 +1516,11 @@ struct ggml_backend_cuda_context {
+             q8_1_cache_mem = nullptr;
+             q8_1_cache_cap = 0;
+         }
++        if (p60_x_cache_mem != nullptr) {
++            (void) cudaFree(p60_x_cache_mem);
++            p60_x_cache_mem = nullptr;
++            p60_x_cache_cap = 0;
++        }
+         q8_1_cache_clear();
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cu b/ggml/src/ggml-cuda/mmvq-p60.cu
+new file mode 100644
+index 000000000..58d417fb4
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-p60.cu
+@@ -0,0 +1,616 @@
++#include "mmvq-p60.cuh"
++
++// A row has NSB superblocks. Lane slot L = sb*4 + q reads superblock sb, quarter q (64 weights, sub-blocks 2q and 2q+1),
++// so LPR = 4*NSB lanes cover a row and a warp does 32/LPR rows per pass.
++// Half bits 0x6400|n == 1024+n, so quants go to half2 with one AND+OR. x is stored per lane slot in matching pair order.
++
++// Convert x to the per-lane fp16 layout and compute the min-term sums (unused by q8_0).
++// x is scaled by a power of 2 so that max|x| lands in [16, 32): 8-term half2 sums of q*x stay below fp16 max even
++// for q8_0 (|q| <= 127), and small x do not drop into fp16 subnormals. inv_scale undoes it.
++// One block per x row: blockIdx.x = token*ne11 + i11, row offset (blockIdx.x / ne11)*s12 + (blockIdx.x % ne11)*s11.
++// blockDim = (32, min(lpr, 32)), lpr = K/64 lane slots.
++static __global__ void __launch_bounds__(1024) mmvq_p60_prep_x(
++        const float * __restrict__ x, half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale,
++        const int lpr, const int ne11, const int64_t s11, const int64_t s12) {
++    const int ly = threadIdx.y, k = threadIdx.x, ny = blockDim.y;
++    const int g = k >> 3, i = k & 7;
++    const float * xc = x + (blockIdx.x / ne11)*s12 + (blockIdx.x % ne11)*s11;
++    const int off = (g >= 2 ? 32 : 0) + 4*i + (g & 1);
++
++    // lpr <= 64 and ny = min(lpr, 32), so each thread owns at most 2 lane slots
++    float a[2], b[2];
++    float amax = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 2; ++j) {
++        const int l = ly + j*ny;
++        a[j] = l < lpr ? xc[64*l + off]     : 0.0f;
++        b[j] = l < lpr ? xc[64*l + off + 2] : 0.0f;
++        amax = fmaxf(amax, fmaxf(fabsf(a[j]), fabsf(b[j])));
++    }
++
++    __shared__ float smax[32];
++    amax = warp_reduce_max(amax);
++    if (k == 0) {
++        smax[ly] = amax;
++    }
++    __syncthreads();
++    amax = warp_reduce_max(k < ny ? smax[k] : 0.0f);
++    int e = 0;
++    frexpf(amax, &e); // amax = f * 2^e, f in [0.5, 1)
++    const float scale = amax > 0.0f ? ldexpf(1.0f, 5 - e) : 1.0f;
++    if (ly == 0 && k == 0) {
++        inv_scale[blockIdx.x] = 1.0f / scale;
++    }
++
++#pragma unroll
++    for (int j = 0; j < 2; ++j) {
++        const int l = ly + j*ny;
++        if (l >= lpr) {
++            break;
++        }
++        xp[(blockIdx.x*lpr + l)*32 + k] = __floats2half2_rn(a[j]*scale, b[j]*scale);
++        if (ss) {
++            const float lo = warp_reduce_sum(k < 16 ? a[j] + b[j] : 0.0f);
++            const float hi = warp_reduce_sum(k < 16 ? 0.0f : a[j] + b[j]);
++            if (k == 0) {
++                ss[blockIdx.x*lpr + l] = make_float2(lo, hi);
++            }
++        }
++    }
++}
++
++static __device__ __forceinline__ half2 p60_as_h2(const uint32_t u) {
++    half2 h;
++    memcpy(&h, &u, sizeof(h));
++    return h;
++}
++
++// Scales and mins of sub-blocks 2q and 2q+1, same decode as get_scale_min_k4 (q4_K and q5_K).
++static __device__ __forceinline__ void p60_scales_k4(const uint32_t s0, const uint32_t s1, const uint32_t s2, const int q,
++                                                     float & sc0, float & m0, float & sc1, float & m1) {
++    const int sh = 16 * (q & 1);
++    const uint32_t a = (s0 >> sh) & 0xFFFF, b = (s1 >> sh) & 0xFFFF, c = (s2 >> sh) & 0xFFFF;
++    uint32_t sc, mn;
++    if (q < 2) {
++        sc = a & 0x3F3F;
++        mn = b & 0x3F3F;
++    } else {
++        sc = (c & 0x0F0F) | ((a & 0xC0C0) >> 2);
++        mn = ((c >> 4) & 0x0F0F) | ((b & 0xC0C0) >> 2);
++    }
++    sc0 = sc & 0xFF; sc1 = sc >> 8; m0 = mn & 0xFF; m1 = mn >> 8;
++}
++
++template <ggml_type type> struct p60_traits;
++
++template <> struct p60_traits<GGML_TYPE_Q4_K> {
++    static constexpr int nload = 3; // dm + scales, qs low half, qs high half
++
++    static __device__ __forceinline__ void load(const char * row, const int sb, const int q, uint4 * d) {
++        const block_q4_K * b = (const block_q4_K *) row + sb;
++        d[0] = __ldg((const uint4 *) b);
++        d[1] = __ldg((const uint4 *) b->qs + 2*q);
++        d[2] = __ldg((const uint4 *) b->qs + 2*q + 1);
++    }
++
++    // value bits for (pair A/B, low/high sub-block): h is unused
++    static __device__ __forceinline__ uint32_t hbits(const uint32_t, const int) {
++        return 0;
++    }
++};
++
++template <> struct p60_traits<GGML_TYPE_Q5_K> {
++    static constexpr int nload = 5; // dm + scales, qh[0:16], qh[16:32], qs low half, qs high half
++
++    static __device__ __forceinline__ void load(const char * row, const int sb, const int q, uint4 * d) {
++        const block_q5_K * b = (const block_q5_K *) row + sb;
++        d[0] = __ldg((const uint4 *) b);
++        d[1] = __ldg((const uint4 *) b->qh);
++        d[2] = __ldg((const uint4 *) b->qh + 1);
++        d[3] = __ldg((const uint4 *) b->qs + 2*q);
++        d[4] = __ldg((const uint4 *) b->qs + 2*q + 1);
++    }
++
++    // 5th bit of the two weights in a pair, moved to bit 4 of each half: qh byte j bit s holds weight j
++    static __device__ __forceinline__ uint32_t hbits(const uint32_t h, const int s) {
++        return ((h >> s) & 0x00010001) << 4;
++    }
++};
++
++template <ggml_type type>
++static __device__ __forceinline__ float p60_dot(const uint4 * d, const uint32_t * xw, const float2 sums, const float inv, const int q) {
++    using tr = p60_traits<type>;
++    const uint4 qa = d[tr::nload - 2], qb = d[tr::nload - 1];
++    const uint32_t w[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
++    uint32_t h[8] = { 0 };
++    if constexpr (type == GGML_TYPE_Q5_K) {
++        h[0] = d[1].x; h[1] = d[1].y; h[2] = d[1].z; h[3] = d[1].w;
++        h[4] = d[2].x; h[5] = d[2].y; h[6] = d[2].z; h[7] = d[2].w;
++    }
++    const int sL = 2*q, sH = 2*q + 1;
++    const half2 k1024 = __float2half2_rn(1024.0f);
++
++    half2 aL = __float2half2_rn(0.0f), bL = aL, aH = aL, bH = aL;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const uint32_t v = w[i];
++        const uint32_t vaL = ( v        & 0x000F000F) | tr::hbits(h[i], sL)     | 0x64006400;
++        const uint32_t vbL = ((v >>  8) & 0x000F000F) | tr::hbits(h[i], sL + 8) | 0x64006400;
++        const uint32_t vaH = ((v >>  4) & 0x000F000F) | tr::hbits(h[i], sH)     | 0x64006400;
++        const uint32_t vbH = ((v >> 12) & 0x000F000F) | tr::hbits(h[i], sH + 8) | 0x64006400;
++        aL = __hfma2(__hsub2(p60_as_h2(vaL), k1024), p60_as_h2(xw[i]),      aL);
++        bL = __hfma2(__hsub2(p60_as_h2(vbL), k1024), p60_as_h2(xw[8 + i]),  bL);
++        aH = __hfma2(__hsub2(p60_as_h2(vaH), k1024), p60_as_h2(xw[16 + i]), aH);
++        bH = __hfma2(__hsub2(p60_as_h2(vbH), k1024), p60_as_h2(xw[24 + i]), bH);
++    }
++    const float2 fL = __half22float2(__hadd2(aL, bL));
++    const float2 fH = __half22float2(__hadd2(aH, bH));
++    const float qxL = (fL.x + fL.y) * inv;
++    const float qxH = (fH.x + fH.y) * inv;
++    const float2 dm = __half22float2(p60_as_h2(d[0].x));
++    float sc0, m0, sc1, m1;
++    p60_scales_k4(d[0].y, d[0].z, d[0].w, q, sc0, m0, sc1, m1);
++    return dm.x * (sc0*qxL + sc1*qxH) - dm.y * (m0*sums.x + m1*sums.y);
++}
++
++// One warp per block, R*C passes of 32/LPR rows each. MUL_MAT_ID: blockIdx.y = token*n_used + slot, ids < 0 = expert not in this pack.
++template <ggml_type type, int NSB, int R, int C>
++static __global__ void __launch_bounds__(32) mmvq_p60(
++        const char * __restrict__ vx, const uint4 * __restrict__ xp, const float2 * __restrict__ ss, const float * __restrict__ inv_scale,
++        const int32_t * __restrict__ ids, float * __restrict__ dst,
++        const int64_t stride_row_x, const int64_t stride_channel_x, const int n_used, const int ids_stride,
++        const int ne11, const int64_t s1, const int64_t s2) {
++    constexpr int LPR   = 4*NSB;
++    constexpr int RPP   = 32/LPR;
++    constexpr int ROWS  = RPP*R*C;
++    constexpr int NLOAD = p60_traits<type>::nload;
++    static_assert(LPR <= 32 && 32 % LPR == 0, "bad row length");
++
++    const int lane  = threadIdx.x;
++    const int slot  = blockIdx.y % n_used;
++    const int token = blockIdx.y / n_used;
++    const int row0  = blockIdx.x * ROWS;
++    const int L = lane % LPR, rsub = lane / LPR;
++    const int sb = L >> 2, q = L & 3;
++
++    float * dst_c = dst + slot*s1 + token*s2;
++
++    int expert = 0, channel_y = 0;
++    if (ids) {
++        expert = ids[token*ids_stride + slot];
++        if (expert < 0) {
++            for (int i = lane; i < ROWS; i += 32) {
++                dst_c[row0 + i] = 0.0f;
++            }
++            return;
++        }
++        channel_y = token*ne11 + slot % ne11;
++    }
++
++    const char * x_e = vx + expert*stride_channel_x;
++
++    uint4 buf[2][NLOAD*R];
++    auto load_chunk = [&](const int c, uint4 * d) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            p60_traits<type>::load(x_e + (row0 + (c*R + r)*RPP + rsub)*stride_row_x, sb, q, d + NLOAD*r);
++        }
++    };
++    load_chunk(0, buf[0]);
++
++    uint4 xv[8];
++    const uint4 * xp_c = xp + (channel_y*LPR + L)*8;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        xv[i] = __ldg(xp_c + i);
++    }
++    const float2 sums = __ldg(ss + channel_y*LPR + L);
++    const float  inv  = __ldg(inv_scale + channel_y);
++    const uint32_t * xw = (const uint32_t *) xv;
++
++#pragma unroll
++    for (int c = 0; c < C; ++c) {
++        const uint4 * cur = buf[c & 1];
++        if (c + 1 < C) {
++            load_chunk(c + 1, buf[(c + 1) & 1]);
++        }
++        float out[R];
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            out[r] = p60_dot<type>(cur + NLOAD*r, xw, sums, inv, q);
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++#pragma unroll
++            for (int off = LPR/2; off > 0; off >>= 1) {
++                out[r] += __shfl_xor_sync(0xffffffff, out[r], off);
++            }
++        }
++        if (L == 0) {
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++                dst_c[row0 + (c*R + r)*RPP + rsub] = out[r];
++            }
++        }
++    }
++}
++
++// q8_0 blocks 2L and 2L+1 of lane slot L: 68 bytes = 17 words, w[0] = d0 | q0[0:2], w[8] = q0[30:32] | d1.
++// int8 to half: (q ^ 0x80) | 0x6400 == 1024 + q + 128 exactly. Result is not scaled by inv_scale yet.
++static __device__ __forceinline__ float p60_dot_q8_0(const uint32_t * w, const uint32_t * xw) {
++    const half2 k1152 = __float2half2_rn(1152.0f);
++    float res = 0.0f;
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const float d = __half2float(__ushort_as_half((unsigned short) (blk == 0 ? w[0] & 0xFFFF : w[8] >> 16)));
++        half2 a = __float2half2_rn(0.0f), b = a;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            const uint32_t q = blk == 0 ? __byte_perm(w[i], w[i + 1], 0x5432) : w[9 + i];
++            const uint32_t u = q ^ 0x80808080;
++            a = __hfma2(__hsub2(p60_as_h2(( u       & 0x00FF00FF) | 0x64006400), k1152), p60_as_h2(xw[16*blk + i]),     a);
++            b = __hfma2(__hsub2(p60_as_h2(((u >> 8) & 0x00FF00FF) | 0x64006400), k1152), p60_as_h2(xw[16*blk + 8 + i]), b);
++        }
++        const float2 f = __half22float2(__hadd2(a, b));
++        res += d * (f.x + f.y);
++    }
++    return res;
++}
++
++// Dense q8_0 MUL_MAT for one column. 34-byte blocks do not allow aligned 16-byte loads per lane, so each chunk of
++// R*RPP rows is loaded with coalesced 16-byte loads into shared memory and every lane then reads its 68 bytes from there.
++// x is loaded once, and the next chunk is in flight during the math.
++template <int NSLOT, int R, int C>
++static __global__ void __launch_bounds__(32) mmvq_p60_q8_0(
++        const char * __restrict__ vx, const uint4 * __restrict__ xp, const float * __restrict__ inv_scale, float * __restrict__ dst,
++        const int64_t stride_row_x) {
++    constexpr int LANES = NSLOT < 32 ? NSLOT : 32; // lanes per row
++    constexpr int RPP   = 32 / LANES;              // rows per pass
++    constexpr int NPASS = NSLOT / LANES;           // passes over a row
++    constexpr int CH    = NSLOT*68/16;             // 16-byte chunks per row
++    constexpr int RCH   = R*RPP;                   // rows per chunk
++    constexpr int CHC   = RCH*CH;
++    constexpr int PER   = (CHC + 31)/32;
++
++    __shared__ uint4 sm[CHC];
++
++    const int lane = threadIdx.x;
++    const int L = lane % LANES, rsub = lane / LANES;
++    const int row0 = blockIdx.x * RCH*C;
++
++    uint4 g[2][PER];
++    auto load_chunk = [&](const int c, uint4 * d) {
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            const int idx = lane + 32*j;
++            if (CHC % 32 == 0 || idx < CHC) {
++                d[j] = __ldg((const uint4 *) (vx + (row0 + c*RCH + idx/CH)*stride_row_x) + idx % CH);
++            }
++        }
++    };
++    load_chunk(0, g[0]);
++
++    uint4 xv[NPASS][8];
++#pragma unroll
++    for (int p = 0; p < NPASS; ++p) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            xv[p][i] = __ldg(xp + (L + LANES*p)*8 + i);
++        }
++    }
++    const float inv = __ldg(inv_scale);
++
++#pragma unroll
++    for (int c = 0; c < C; ++c) {
++#pragma unroll
++        for (int j = 0; j < PER; ++j) {
++            const int idx = lane + 32*j;
++            if (CHC % 32 == 0 || idx < CHC) {
++                sm[idx] = g[c & 1][j];
++            }
++        }
++        __syncwarp();
++        if (c + 1 < C) {
++            load_chunk(c + 1, g[(c + 1) & 1]);
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            float v = 0.0f;
++#pragma unroll
++            for (int p = 0; p < NPASS; ++p) {
++                uint32_t w[17];
++                const uint32_t * sw = (const uint32_t *) (sm + (r*RPP + rsub)*CH) + 17*(L + LANES*p);
++#pragma unroll
++                for (int j = 0; j < 17; ++j) {
++                    w[j] = sw[j];
++                }
++                v += p60_dot_q8_0(w, (const uint32_t *) xv[p]);
++            }
++#pragma unroll
++            for (int off = LANES/2; off > 0; off >>= 1) {
++                v += __shfl_xor_sync(0xffffffff, v, off);
++            }
++            if (L == 0) {
++                dst[row0 + c*RCH + r*RPP + rsub] = v * inv;
++            }
++        }
++        __syncwarp();
++    }
++}
++
++template <int NSLOT, int R, int C>
++static void mmvq_p60_q8_0_launch(const char * vx, const char * prep, const size_t xp_bytes, const size_t ss_bytes, float * dst,
++        const int64_t nrows, const int64_t nb01, cudaStream_t stream) {
++    constexpr int ROWS = (32/(NSLOT < 32 ? NSLOT : 32))*R*C;
++    GGML_ASSERT(nrows % ROWS == 0);
++    mmvq_p60_q8_0<NSLOT, R, C><<<nrows / ROWS, 32, 0, stream>>>(
++        vx, (const uint4 *) prep, (const float *) (prep + xp_bytes + ss_bytes), dst, nb01);
++}
++
++template <ggml_type type, int NSB, int R, int C>
++static void mmvq_p60_launch(const char * vx, const char * prep, const size_t xp_bytes, const size_t ss_bytes, const int32_t * ids, float * dst,
++        const int64_t nrows, const int64_t nb01, const int64_t nb02, const int n_used, const int n_tokens, const int ids_stride,
++        const int ne11, const int64_t s1, const int64_t s2, cudaStream_t stream) {
++    constexpr int ROWS = (32/(4*NSB))*R*C;
++    GGML_ASSERT(nrows % ROWS == 0);
++    const dim3 grid(nrows / ROWS, n_used*n_tokens);
++    mmvq_p60<type, NSB, R, C><<<grid, 32, 0, stream>>>(
++        vx, (const uint4 *) prep, (const float2 *) (prep + xp_bytes), (const float *) (prep + xp_bytes + ss_bytes),
++        ids, dst, nb01, nb02, n_used, ids_stride, ne11, s1, s2);
++}
++
++bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_P60_MMVQ");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    if (!enabled) {
++        return false;
++    }
++
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_DP4A) {
++        return false;
++    }
++    if (fusion && (fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale)) {
++        return false;
++    }
++    const bool is_q8_0 = src0->type == GGML_TYPE_Q8_0;
++    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && !is_q8_0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // small q8_0 matrices do not have enough rows to hide latency, stock MMVQ is faster there
++    if (is_q8_0 && (ids || src0->ne[0] < 2048 || src0->ne[1] < 2048)) {
++        return false;
++    }
++
++    GGML_TENSOR_BINARY_OP_LOCALS;
++
++    // every config below covers at most 16 rows per warp
++    if ((ne00 != 2048 && ne00 != 512 && (!is_q8_0 || ne00 != 4096)) || ne01 % 16 != 0) {
++        return false;
++    }
++    if (nb10 != sizeof(float) || nb0 != sizeof(float)) {
++        return false;
++    }
++    if (src0->nb[1] % 16 != 0 || src0->nb[2] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0) {
++        return false; // 16-byte weight loads
++    }
++
++    // MUL_MAT_ID: src1 [K, ne11 = n_used or 1, n_tokens], dst [rows, n_used, n_tokens], ids [n_used, n_tokens]
++    int n_used = 1, n_tokens = 1, ids_stride = 0;
++    if (ids) {
++        n_used   = ne1;
++        n_tokens = ne2;
++        if (ne3 != 1 || ne13 != 1 || ne12 != n_tokens || (ne11 != 1 && ne11 != n_used) ||
++                ids->type != GGML_TYPE_I32 || ids->ne[0] != n_used || ids->ne[1] != n_tokens) {
++            return false;
++        }
++        ids_stride = ids->nb[1] / sizeof(int32_t);
++    } else if (ne1 != 1 || ne11 != 1 || ne02 != 1 || ne12 != 1 || ne03 != 1 || ne13 != 1) {
++        return false;
++    }
++    const int     lpr     = ne00/64;
++    const int64_t nrows_y = ids ? ne11*ne12 : ne11;
++    const int64_t s11 = nb11 / sizeof(float);
++    const int64_t s12 = nb12 / sizeof(float);
++
++    cudaStream_t stream = ctx.stream();
++
++    // gate and up share src1: reuse the prep, same rules as the q8_1 cache in mmvq.cu.
++    // One x row per expert slot (ffn_down) is never shared, so it does not evict the cache.
++    const size_t xp_bytes   = nrows_y*lpr*32*sizeof(half2);
++    const size_t ss_bytes   = nrows_y*lpr*sizeof(float2);
++    const size_t prep_bytes = xp_bytes + ss_bytes + nrows_y*sizeof(float);
++    ggml_cuda_pool_alloc<char> prep_scoped(ctx.pool());
++    char * prep = nullptr;
++
++    // Key on the viewed tensor, so the routed experts (MUL_MAT_ID on a reshape) and the shared expert (MUL_MAT) share it.
++    // Cached rows are always evenly spaced: by s12 for MUL_MAT_ID with ne11 == 1, by s11 for MUL_MAT.
++    const ggml_tensor * base = src1->view_src ? src1->view_src : src1;
++    const int64_t row_stride = ids ? s12 : s11;
++    const bool cacheable = (!ids || ne11 == 1) && (ctx.p60_x_cache_stream == nullptr || ctx.p60_x_cache_stream == stream);
++    const bool hit = cacheable &&
++                     ctx.p60_x_cache_mem    != nullptr &&
++                     ctx.p60_x_cache_src1   == base &&
++                     ctx.p60_x_cache_data   == src1->data &&
++                     ctx.p60_x_cache_stream == stream &&
++                     ctx.p60_x_cache_nch    == nrows_y &&
++                     ctx.p60_x_cache_s[0]   == row_stride &&
++                     ctx.p60_x_cache_s[1]   == ne00;
++    if (hit) {
++        prep = ctx.p60_x_cache_mem;
++    } else {
++        if (!cacheable) {
++            prep = prep_scoped.alloc(prep_bytes);
++        } else {
++            if (prep_bytes > ctx.p60_x_cache_cap) {
++                if (ctx.p60_x_cache_mem != nullptr) {
++                    CUDA_CHECK(cudaFree(ctx.p60_x_cache_mem));
++                }
++                ggml_cuda_set_device(ctx.device);
++                CUDA_CHECK(cudaMalloc((void **) &ctx.p60_x_cache_mem, prep_bytes));
++                ctx.p60_x_cache_cap = prep_bytes;
++            }
++            prep = ctx.p60_x_cache_mem;
++            ctx.p60_x_cache_src1   = base;
++            ctx.p60_x_cache_data   = src1->data;
++            ctx.p60_x_cache_stream = stream;
++            ctx.p60_x_cache_nch    = nrows_y;
++            ctx.p60_x_cache_s[0]   = row_stride;
++            ctx.p60_x_cache_s[1]   = ne00;
++        }
++        mmvq_p60_prep_x<<<nrows_y, dim3(32, std::min(lpr, 32)), 0, stream>>>(
++            (const float *) src1->data, (half2 *) prep, is_q8_0 && !cacheable ? nullptr : (float2 *) (prep + xp_bytes),
++            (float *) (prep + xp_bytes + ss_bytes), lpr, ne11, s11, s12);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    const char    * vx    = (const char *) src0->data;
++    const int32_t * ids_d = ids ? (const int32_t *) ids->data : nullptr;
++    float         * dst_d = (float *) dst->data;
++    const int       ne11_ = ids ? ne11 : 1;
++    const int64_t   s1    = nb1 / sizeof(float);
++    const int64_t   s2    = nb2 / sizeof(float);
++
++    switch (src0->type) {
++        case GGML_TYPE_Q4_K:
++            if (ne00 == 2048) {
++                mmvq_p60_launch<GGML_TYPE_Q4_K, 8, 2, 4>(vx, prep, xp_bytes, ss_bytes, ids_d, dst_d, ne01, nb01, nb02, n_used, n_tokens, ids_stride, ne11_, s1, s2, stream);
++            } else {
++                mmvq_p60_launch<GGML_TYPE_Q4_K, 2, 2, 2>(vx, prep, xp_bytes, ss_bytes, ids_d, dst_d, ne01, nb01, nb02, n_used, n_tokens, ids_stride, ne11_, s1, s2, stream);
++            }
++            break;
++        case GGML_TYPE_Q5_K:
++            if (ne00 == 2048) {
++                mmvq_p60_launch<GGML_TYPE_Q5_K, 8, 1, 4>(vx, prep, xp_bytes, ss_bytes, ids_d, dst_d, ne01, nb01, nb02, n_used, n_tokens, ids_stride, ne11_, s1, s2, stream);
++            } else {
++                mmvq_p60_launch<GGML_TYPE_Q5_K, 2, 1, 4>(vx, prep, xp_bytes, ss_bytes, ids_d, dst_d, ne01, nb01, nb02, n_used, n_tokens, ids_stride, ne11_, s1, s2, stream);
++            }
++            break;
++        case GGML_TYPE_Q8_0:
++            if (ne00 == 2048) {
++                mmvq_p60_q8_0_launch<32, 2, 2>(vx, prep, xp_bytes, ss_bytes, dst_d, ne01, nb01, stream);
++            } else {
++                mmvq_p60_q8_0_launch<64, 1, 2>(vx, prep, xp_bytes, ss_bytes, dst_d, ne01, nb01, stream);
++            }
++            break;
++        default:
++            GGML_ABORT("fatal error");
++    }
++    CUDA_CHECK(cudaGetLastError());
++
++    return true;
++}
++
++// RMS norm * weight for 2048-wide rows that also writes the mmvq-p60 x layout, so the matvecs that read this
++// output find their prep in the cache and skip mmvq_p60_prep_x. Thread (k, l) owns the same 2 values as in
++// mmvq_p60_prep_x, so every element is normalized, stored and converted exactly once. One block per row.
++static __global__ void __launch_bounds__(1024) p60_rms_norm_mul(
++        const float * __restrict__ x, const int64_t stride_row, const float * __restrict__ w, float * __restrict__ dst,
++        half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale, const float eps) {
++    constexpr int ncols = 2048;
++    constexpr int lpr   = ncols/64;
++    const int k = threadIdx.x, l = threadIdx.y, row = blockIdx.x;
++    const int g = k >> 3, i = k & 7;
++    const int c0 = 64*l + (g >= 2 ? 32 : 0) + 4*i + (g & 1);
++    const int c1 = c0 + 2;
++
++    const float * xr = x + row*stride_row;
++    const float a = xr[c0], b = xr[c1];
++
++    __shared__ float red[32];
++    float t = warp_reduce_sum(a*a + b*b);
++    if (k == 0) {
++        red[l] = t;
++    }
++    __syncthreads();
++    t = warp_reduce_sum(red[k]);
++    const float rs = rsqrtf(t/ncols + eps);
++    const float ya = a*rs*w[c0];
++    const float yb = b*rs*w[c1];
++    dst[row*ncols + c0] = ya;
++    dst[row*ncols + c1] = yb;
++    __syncthreads();
++
++    float amax = warp_reduce_max(fmaxf(fabsf(ya), fabsf(yb)));
++    if (k == 0) {
++        red[l] = amax;
++    }
++    __syncthreads();
++    amax = warp_reduce_max(red[k]);
++    int e = 0;
++    frexpf(amax, &e);
++    const float scale = amax > 0.0f ? ldexpf(1.0f, 5 - e) : 1.0f;
++    if (l == 0 && k == 0) {
++        inv_scale[row] = 1.0f / scale;
++    }
++    xp[(row*lpr + l)*32 + k] = __floats2half2_rn(ya*scale, yb*scale);
++    const float lo = warp_reduce_sum(k < 16 ? ya + yb : 0.0f);
++    const float hi = warp_reduce_sum(k < 16 ? 0.0f : ya + yb);
++    if (k == 0) {
++        ss[row*lpr + l] = make_float2(lo, hi);
++    }
++}
++
++bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_P60_MMVQ");
++        const char * f = getenv("GGML_CUDA_P60_FUSE_NORM");
++        return e != nullptr && atoi(e) != 0 && (f == nullptr || atoi(f) != 0);
++    }();
++    if (!enabled) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_DP4A) {
++        return false;
++    }
++
++    const ggml_tensor * src = rms_norm->src[0];
++    const ggml_tensor * w   = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
++    const int64_t nrows = src->ne[1];
++    if (src->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
++            src->ne[0] != 2048 || src->ne[2] != 1 || src->ne[3] != 1 || nrows > 8 || src->nb[0] != sizeof(float) ||
++            w->ne[0] != 2048 || ggml_nelements(w) != 2048 || !ggml_is_contiguous(w) ||
++            !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(src, mul_tensor)) {
++        return false;
++    }
++
++    cudaStream_t stream = ctx.stream();
++    if (ctx.p60_x_cache_stream != nullptr && ctx.p60_x_cache_stream != stream) {
++        return false;
++    }
++
++    constexpr int lpr = 2048/64;
++    const size_t xp_bytes   = nrows*lpr*32*sizeof(half2);
++    const size_t ss_bytes   = nrows*lpr*sizeof(float2);
++    const size_t prep_bytes = xp_bytes + ss_bytes + nrows*sizeof(float);
++    if (prep_bytes > ctx.p60_x_cache_cap) {
++        if (ctx.p60_x_cache_mem != nullptr) {
++            CUDA_CHECK(cudaFree(ctx.p60_x_cache_mem));
++        }
++        ggml_cuda_set_device(ctx.device);
++        CUDA_CHECK(cudaMalloc((void **) &ctx.p60_x_cache_mem, prep_bytes));
++        ctx.p60_x_cache_cap = prep_bytes;
++    }
++    char * prep = ctx.p60_x_cache_mem;
++
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++    p60_rms_norm_mul<<<nrows, dim3(32, 32), 0, stream>>>(
++        (const float *) src->data, src->nb[1] / sizeof(float), (const float *) w->data, (float *) mul_tensor->data,
++        (half2 *) prep, (float2 *) (prep + xp_bytes), (float *) (prep + xp_bytes + ss_bytes), eps);
++    CUDA_CHECK(cudaGetLastError());
++
++    // same key the matvecs compute for this tensor: MUL_MAT reads it directly, MUL_MAT_ID through a reshape view
++    ctx.p60_x_cache_src1   = mul_tensor;
++    ctx.p60_x_cache_data   = mul_tensor->data;
++    ctx.p60_x_cache_stream = stream;
++    ctx.p60_x_cache_nch    = nrows;
++    ctx.p60_x_cache_s[0]   = mul_tensor->nb[1] / sizeof(float);
++    ctx.p60_x_cache_s[1]   = 2048;
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cuh b/ggml/src/ggml-cuda/mmvq-p60.cuh
+new file mode 100644
+index 000000000..10948a96e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-p60.cuh
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include "common.cuh"
++
++// Single-token matvec for NVIDIA GPUs without dp4a (sm_60), with fp16x2 math.
++// Returns false if the case is not supported; the caller then uses stock MMVQ. Off by default, GGML_CUDA_P60_MMVQ=1 enables it.
++bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++    const ggml_cuda_mm_fusion_args_host * fusion);
++
++// Fused RMS norm * weight for 2048-wide rows that also fills the mmvq-p60 activation cache for its output.
++// Returns false (and does nothing) if not applicable. GGML_CUDA_P60_FUSE_NORM=0 disables it.
++bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 896f408a3..6fa7e0748 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvq-p60.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -1488,6 +1489,10 @@ void ggml_cuda_mul_mat_vec_q(
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+ 
++    if (ggml_cuda_mmvq_p60(ctx, src0, src1, ids, dst, fusion)) {
++        return;
++    }
++
+     GGML_TENSOR_BINARY_OP_LOCALS;
+ 
+     cudaStream_t stream = ctx.stream();
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index d3a4fbda4..b056c5b3a 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "mmvq-p60.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -704,6 +705,10 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ }
+ 
+ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
++    if (ggml_cuda_p60_rms_norm_mul(ctx, dst, mul_tensor)) {
++        return;
++    }
++
+     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+     float eps = 0.0f;
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index cc68e9ca7..fad3e166d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5198,6 +5198,83 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// RMS_NORM * weight feeding a matmul: on sm_60 with GGML_CUDA_P60_MMVQ=1 the fused norm also fills the
++// mmvq-p60 activation cache, and the matmul reads it from there (MUL_MAT_ID through a reshape view)
++struct test_p60_norm_matmul : public test_case {
++    const ggml_type type_a;
++    const int64_t m;
++    const int64_t n_tokens;
++    const bool use_id;
++    const bool skip;
++
++    std::string vars() override {
++        return VARS_TO_STR5(type_a, m, n_tokens, use_id, skip);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "P60_NORM_MATMUL";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_p60_norm_matmul(ggml_type type_a = GGML_TYPE_Q4_K, int64_t m = 512, int64_t n_tokens = 1, bool use_id = false, bool skip = false)
++        : type_a(type_a), m(m), n_tokens(n_tokens), use_id(use_id), skip(skip) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t k = 2048;
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
++        ggml_set_name(x, "x");
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++        ggml_set_name(w, "w");
++        ggml_tensor * a = use_id ? ggml_new_tensor_3d(ctx, type_a, k, m, 16) : ggml_new_tensor_2d(ctx, type_a, k, m);
++        ggml_set_name(a, "a");
++        ggml_tensor * ids = nullptr;
++        if (use_id) {
++            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 16, n_tokens);
++            ggml_set_name(ids, "ids");
++            ids = ggml_view_2d(ctx, ids, 4, n_tokens, ids->nb[1], 0);
++        }
++
++        // use x and w early, so no OP_NONE ends up between rms_norm and mul (that would block the fusion)
++        x = ggml_add(ctx, x, w);
++        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
++        ggml_tensor * out;
++        if (use_id) {
++            out = ggml_mul_mat_id(ctx, a, ggml_reshape_3d(ctx, cur, k, 1, n_tokens), ids);
++            out->op_params[0] = skip ? 1 : 0;
++        } else {
++            out = ggml_mul_mat(ctx, a, cur);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, 16);
++        if (!skip) {
++            return;
++        }
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
++                continue;
++            }
++            for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                std::vector<int32_t> data(t->ne[0]);
++                ggml_backend_tensor_get(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
++                for (int i = 1; i < 4; i += 2) {
++                    data[i] = -1;
++                }
++                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
++            }
++        }
++    }
++};
++
+ // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+ struct test_mul_mat_id_fusion : public test_case {
+     const ggml_type type_a;
+@@ -9884,6 +9961,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 4, 128, {2, 3}));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+ 
++    // mmvq-p60: fused RMS norm filling the activation cache for the matmul that follows
++    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0 }) {
++        test_cases.emplace_back(new test_p60_norm_matmul(t, 2048, 1, false));
++        test_cases.emplace_back(new test_p60_norm_matmul(t, 2048, 2, false));
++        if (t != GGML_TYPE_Q8_0) {
++            for (int64_t nt : { 1, 3 }) {
++                test_cases.emplace_back(new test_p60_norm_matmul(t, 512, nt, true, false));
++            }
++        }
++    }
+ #if 0
+     // > 4GB A matrix. Too slow to be enabled by default.
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
+-- 
+2.56.0
+

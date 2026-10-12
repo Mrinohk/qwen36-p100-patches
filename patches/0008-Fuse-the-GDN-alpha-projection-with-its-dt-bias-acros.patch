@@ -1,0 +1,60 @@
+From 316027f9a60c08ce528117f70b597b5f67c25744 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 12:56:34 -0400
+Subject: [PATCH 08/31] Fuse the GDN alpha projection with its dt bias across
+ the reshape
+
+The gated delta net's alpha is ADD(RESHAPE(MUL_MAT(ssm_alpha, x)), ssm_dt).
+Stock's matvec + bias fusion only matches an ADD directly after the MUL_MAT,
+so the reshape node between them kept the add as its own launch. A matcher
+for MUL_MAT -> RESHAPE -> ADD now hands the bias to stock's fused mmvf (the
+same value + bias after the reduction), writing straight into the add's
+output. Only on with GGML_CUDA_P60_MMVQ=1; GGML_CUDA_P60_FUSE_MM_BIAS=0 turns
+it off.
+
+2x P100: 28 launches/token fewer (1324 -> 1296; stock is 1677). The bias
+variant of mmvf is slower per launch than the plain one, so the net is
+small: MTP 8-prompt +0.2% and +0.1% in two rounds. Wikitext KLD at ub=1 vs
+the previous commit: 0, same top 100%; MTP outputs byte-identical.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 85fba3085..75836e3a5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4335,6 +4335,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // MUL_MAT -> RESHAPE -> ADD (the gated delta net's alpha projection + dt bias): stock's fused-bias matvec, which
++    // the reshape node between the two otherwise hides from the match below
++    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes &&
++            cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 2]->op == GGML_OP_ADD) {
++        static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0 &&
++            (getenv("GGML_CUDA_P60_FUSE_MM_BIAS") == nullptr || atoi(getenv("GGML_CUDA_P60_FUSE_MM_BIAS")) != 0);
++        ggml_tensor * rs  = cgraph->nodes[i + 1];
++        ggml_tensor * add = cgraph->nodes[i + 2];
++        const ggml_tensor * bias = add->src[0] == rs ? add->src[1] : add->src[1] == rs ? add->src[0] : nullptr;
++        const int out[] = { i + 2 };
++        if (enabled && bias != nullptr && rs->src[0] == node && ggml_are_same_shape(add->src[0], add->src[1]) &&
++                ggml_is_contiguous(node) && ggml_nelements(node) == ggml_nelements(add) &&
++                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD }, { i + 2 }) &&
++                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out, 1) &&
++                ggml_cuda_should_fuse_mul_mat_vec_f(node)) {
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.x_bias = bias;
++            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion_data);
++            return 2;
++        }
++    }
++
+     // mul_mat + add
+     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+-- 
+2.56.0
+

@@ -1,0 +1,360 @@
+From c04b45dac3ef269041036a794332d2188b078d96 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 10:10:16 -0400
+Subject: [PATCH 03/31] cuda : fold residual adds into the sm_60 fused rms_norm
+
+One kernel for [add ->] add -> rms_norm -> mul. It stores the sum (the
+residual stream) and the normalized output. Outputs may alias inputs only
+at the same address, since the allocator often runs these adds in place.
+GGML_CUDA_P60_FUSE_ADD=0 disables it.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  14 +++
+ ggml/src/ggml-cuda/mmvq-p60.cu  | 154 +++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/mmvq-p60.cuh |   5 ++
+ tests/test-backend-ops.cpp      |  69 ++++++++++++++
+ 4 files changed, 212 insertions(+), 30 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1f6cffa3c..93f4ec446 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -32,6 +32,7 @@
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/mmvq-p60.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -3560,6 +3561,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // residual add(s) folded into the RMS norm that follows (mmvq-p60, sm_60)
++    if (node->op == GGML_OP_ADD) {
++        // the allocator often puts an add in place; ggml_cuda_p60_add_rms_norm_mul allows exact aliasing only
++        if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1, i + 3 }) &&
++                ggml_cuda_p60_add_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
++            return 3;
++        }
++        if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) &&
++                ggml_cuda_p60_add_rms_norm_mul(*cuda_ctx, nullptr, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
++            return 2;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cu b/ggml/src/ggml-cuda/mmvq-p60.cu
+index 46961cf4b..c63ae5178 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cu
++++ b/ggml/src/ggml-cuda/mmvq-p60.cu
+@@ -535,11 +535,14 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+     return true;
+ }
+ 
+-// RMS norm * weight for 2048-wide rows that also writes the mmvq-p60 x layout, so the matvecs that read this
+-// output find their prep in the cache and skip mmvq_p60_prep_x. Thread (k, l) owns the same 2 values as in
+-// mmvq_p60_prep_x, so every element is normalized, stored and converted exactly once. One block per row.
+-static __global__ void __launch_bounds__(1024) p60_rms_norm_mul(
+-        const float * __restrict__ x, const int64_t stride_row, const float * __restrict__ w, float * __restrict__ dst,
++// [x0 + x1 (+ x2) ->] RMS norm * weight for 2048-wide rows, optionally also writing the mmvq-p60 x layout so the
++// matvecs that read this output skip mmvq_p60_prep_x. With adds, the sum (the residual stream) is stored too.
++// Thread (k, l) owns the same 2 values as in mmvq_p60_prep_x and reads them before anything is written, so the
++// outputs may alias the inputs. The sum is (x0 + x1) + x2, the graph's order. One block per row.
++template <int NADD, bool PREP>
++static __global__ void __launch_bounds__(1024) p60_add_rms_norm_mul(
++        const float * x0, const float * x1, const float * x2, const int64_t stride_row, float * sum,
++        const float * __restrict__ w, float * dst,
+         half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale, const float eps) {
+     constexpr int ncols = 2048;
+     constexpr int lpr   = ncols/64;
+@@ -548,8 +551,20 @@ static __global__ void __launch_bounds__(1024) p60_rms_norm_mul(
+     const int c0 = 64*l + (g >= 2 ? 32 : 0) + 4*i + (g & 1);
+     const int c1 = c0 + 2;
+ 
+-    const float * xr = x + row*stride_row;
+-    const float a = xr[c0], b = xr[c1];
++    const int64_t r0 = row*stride_row;
++    float a = x0[r0 + c0], b = x0[r0 + c1];
++    if constexpr (NADD >= 1) {
++        a += x1[r0 + c0];
++        b += x1[r0 + c1];
++    }
++    if constexpr (NADD >= 2) {
++        a += x2[r0 + c0];
++        b += x2[r0 + c1];
++    }
++    if constexpr (NADD >= 1) {
++        sum[row*ncols + c0] = a;
++        sum[row*ncols + c1] = b;
++    }
+ 
+     __shared__ float red[32];
+     float t = warp_reduce_sum(a*a + b*b);
+@@ -563,6 +578,9 @@ static __global__ void __launch_bounds__(1024) p60_rms_norm_mul(
+     const float yb = b*rs*w[c1];
+     dst[row*ncols + c0] = ya;
+     dst[row*ncols + c1] = yb;
++    if constexpr (!PREP) {
++        return;
++    }
+     __syncthreads();
+ 
+     float amax = warp_reduce_max(fmaxf(fabsf(ya), fabsf(yb)));
+@@ -585,12 +603,18 @@ static __global__ void __launch_bounds__(1024) p60_rms_norm_mul(
+     }
+ }
+ 
+-bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+-    static const bool enabled = [] {
+-        const char * e = getenv("GGML_CUDA_P60_MMVQ");
+-        const char * f = getenv("GGML_CUDA_P60_FUSE_NORM");
+-        return e != nullptr && atoi(e) != 0 && (f == nullptr || atoi(f) != 0);
+-    }();
++static bool p60_env_on(const char * name) {
++    const char * e = getenv(name);
++    return e == nullptr || atoi(e) != 0;
++}
++
++// x[0..nadd] are summed (nadd adds) into sum_dst, then normalized into mul_tensor. Prep is written only for 2+ rows
++// (the token-count policy: with one token the matvecs that read a norm output stay on stock MMVQ).
++static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * const * x, const int nadd, ggml_tensor * sum_dst,
++        const ggml_tensor * rms_norm, ggml_tensor * mul_tensor, const bool need_prep) {
++    static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0;
++    static const bool all     = getenv("GGML_CUDA_P60_ALL")  != nullptr && atoi(getenv("GGML_CUDA_P60_ALL"))  != 0;
++    static const bool prep_on = p60_env_on("GGML_CUDA_P60_FUSE_NORM");
+     if (!enabled) {
+         return false;
+     }
+@@ -599,37 +623,107 @@ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tens
+         return false;
+     }
+ 
+-    const ggml_tensor * src = rms_norm->src[0];
+-    const ggml_tensor * w   = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
+-    const int64_t nrows = src->ne[1];
+-    if (src->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
+-            src->ne[0] != 2048 || src->ne[2] != 1 || src->ne[3] != 1 || nrows > 8 || src->nb[0] != sizeof(float) ||
+-            (nrows == 1 && (getenv("GGML_CUDA_P60_ALL") == nullptr || atoi(getenv("GGML_CUDA_P60_ALL")) == 0)) ||
+-            w->ne[0] != 2048 || ggml_nelements(w) != 2048 || !ggml_is_contiguous(w) ||
+-            !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(src, mul_tensor)) {
++    const ggml_tensor * w = mul_tensor->src[0] == rms_norm ? mul_tensor->src[1] : mul_tensor->src[0];
++    const int64_t nrows = x[0]->ne[1];
++    if (w->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 || w->ne[0] != 2048 || ggml_nelements(w) != 2048 ||
++            !ggml_is_contiguous(w) || !ggml_is_contiguous(mul_tensor) || nrows > 8) {
+         return false;
+     }
++    for (int j = 0; j <= nadd; ++j) {
++        if (x[j]->type != GGML_TYPE_F32 || x[j]->ne[0] != 2048 || x[j]->ne[1] != nrows || x[j]->ne[2] != 1 || x[j]->ne[3] != 1 ||
++                x[j]->nb[0] != sizeof(float) || x[j]->nb[1] != x[0]->nb[1]) {
++            return false;
++        }
++    }
++    if (nadd > 0 && (!ggml_is_contiguous(sum_dst) || !ggml_are_same_shape(sum_dst, mul_tensor))) {
++        return false;
++    }
++    // Each thread reads its elements before it writes the same positions, so an output may alias an input exactly
++    // (the allocator puts adds in place), but not partially or at another offset.
++    if (nadd > 0) {
++        const ggml_tensor * outs[2] = { sum_dst, mul_tensor };
++        for (const ggml_tensor * o : outs) {
++            const char * o0 = (const char *) o->data, * o1 = o0 + ggml_nbytes(o);
++            for (int j = 0; j <= nadd; ++j) {
++                const char * a0 = (const char *) x[j]->data, * a1 = a0 + ggml_nbytes(x[j]);
++                if (a0 < o1 && o0 < a1 && (a0 != o0 || !ggml_is_contiguous(x[j]))) {
++                    return false;
++                }
++            }
++            const char * w0 = (const char *) w->data, * w1 = w0 + ggml_nbytes(w);
++            if (w0 < o1 && o0 < w1) {
++                return false;
++            }
++        }
++    }
+ 
++    const bool prep = prep_on && (nrows >= 2 || all);
++    if (need_prep && !prep) {
++        return false; // a plain RMS norm * weight: stock does the same work
++    }
+     cudaStream_t stream = ctx.stream();
+-    if (!p60_cache_usable(ctx, stream)) {
++    if (prep && !p60_cache_usable(ctx, stream)) {
+         return false;
+     }
+ 
+-    // same key the matvecs compute for this tensor: MUL_MAT reads it directly, MUL_MAT_ID through a reshape view
+-    constexpr int lpr = 2048/64;
+-    size_t xp_bytes, ss_bytes;
+-    const size_t prep_bytes = p60_prep_bytes(nrows, lpr, &xp_bytes, &ss_bytes);
+-    char * prep = p60_cache_claim(ctx, mul_tensor, mul_tensor->data, stream, nrows, mul_tensor->nb[1] / sizeof(float), 2048, prep_bytes);
++    char * pr = nullptr;
++    size_t xp_bytes = 0, ss_bytes = 0;
++    if (prep) {
++        // same key the matvecs compute for this tensor: MUL_MAT reads it directly, MUL_MAT_ID through a reshape view
++        const size_t prep_bytes = p60_prep_bytes(nrows, 2048/64, &xp_bytes, &ss_bytes);
++        pr = p60_cache_claim(ctx, mul_tensor, mul_tensor->data, stream, nrows, mul_tensor->nb[1] / sizeof(float), 2048, prep_bytes);
++    }
+ 
+     float eps = 0.0f;
+     memcpy(&eps, rms_norm->op_params, sizeof(float));
+-    p60_rms_norm_mul<<<nrows, dim3(32, 32), 0, stream>>>(
+-        (const float *) src->data, src->nb[1] / sizeof(float), (const float *) w->data, (float *) mul_tensor->data,
+-        (half2 *) prep, (float2 *) (prep + xp_bytes), (float *) (prep + xp_bytes + ss_bytes), eps);
++    const float * x0 = (const float *) x[0]->data;
++    const float * x1 = nadd >= 1 ? (const float *) x[1]->data : nullptr;
++    const float * x2 = nadd >= 2 ? (const float *) x[2]->data : nullptr;
++    float * sum = nadd > 0 ? (float *) sum_dst->data : nullptr;
++    half2  * xp = prep ? (half2  *) pr : nullptr;
++    float2 * ss = prep ? (float2 *) (pr + xp_bytes) : nullptr;
++    float  * is = prep ? (float  *) (pr + xp_bytes + ss_bytes) : nullptr;
++    const int64_t sr = x[0]->nb[1] / sizeof(float);
++    const dim3 grid(nrows), block(32, 32);
++#define P60_NORM_LAUNCH(N, P) p60_add_rms_norm_mul<N, P><<<grid, block, 0, stream>>>(x0, x1, x2, sr, sum, (const float *) w->data, (float *) mul_tensor->data, xp, ss, is, eps)
++    switch (nadd*2 + (prep ? 1 : 0)) {
++        case 0: P60_NORM_LAUNCH(0, false); break;
++        case 1: P60_NORM_LAUNCH(0, true);  break;
++        case 2: P60_NORM_LAUNCH(1, false); break;
++        case 3: P60_NORM_LAUNCH(1, true);  break;
++        case 4: P60_NORM_LAUNCH(2, false); break;
++        case 5: P60_NORM_LAUNCH(2, true);  break;
++        default: GGML_ABORT("fatal error");
++    }
++#undef P60_NORM_LAUNCH
+     CUDA_CHECK(cudaGetLastError());
+     return true;
+ }
+ 
++bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
++    const ggml_tensor * x[1] = { rms_norm->src[0] };
++    return p60_fused_norm(ctx, x, 0, nullptr, rms_norm, mul_tensor, /*need_prep =*/ true);
++}
++
++bool ggml_cuda_p60_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add0, ggml_tensor * add1,
++        const ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
++    static const bool enabled = p60_env_on("GGML_CUDA_P60_FUSE_ADD");
++    if (!enabled || rms_norm->src[0] != add1 || (mul_tensor->src[0] != rms_norm && mul_tensor->src[1] != rms_norm)) {
++        return false;
++    }
++    if (add0 == nullptr) {
++        const ggml_tensor * x[2] = { add1->src[0], add1->src[1] };
++        return p60_fused_norm(ctx, x, 1, add1, rms_norm, mul_tensor, false);
++    }
++    // add1 = add0 + other (either operand order); add0 itself is not stored, it has no other users
++    const ggml_tensor * other = add1->src[0] == add0 ? add1->src[1] : add1->src[1] == add0 ? add1->src[0] : nullptr;
++    if (other == nullptr || add1->src[0] != add0) {
++        return false; // keep (x0 + x1) + x2 in the graph's operand order
++    }
++    const ggml_tensor * x[3] = { add0->src[0], add0->src[1], other };
++    return p60_fused_norm(ctx, x, 2, add1, rms_norm, mul_tensor, false);
++}
++
+ // silu(gate) * up for rows of K = 64*lpr that also writes the mmvq-p60 x layout, so ffn_down skips
+ // mmvq_p60_prep_x. Same thread mapping as p60_rms_norm_mul. One block per row, blockDim = (32, lpr).
+ static __global__ void __launch_bounds__(1024) p60_swiglu(
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cuh b/ggml/src/ggml-cuda/mmvq-p60.cuh
+index cf1018e21..e43263061 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cuh
++++ b/ggml/src/ggml-cuda/mmvq-p60.cuh
+@@ -15,3 +15,8 @@ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tens
+ // Fused swiglu (silu(gate) * up) that also fills the mmvq-p60 activation cache for its output (the ffn_down input).
+ // Returns false (and does nothing) if not applicable. GGML_CUDA_P60_FUSE_GLU=0 disables it.
+ bool ggml_cuda_p60_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// Fused [add0 ->] add1 -> RMS norm -> mul for 2048-wide rows: stores add1 (the residual stream) and the normalized
++// output; add0 (may be null) must be used only by add1. Returns false if not applicable. GGML_CUDA_P60_FUSE_ADD=0 disables it.
++bool ggml_cuda_p60_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add0, ggml_tensor * add1,
++    const ggml_tensor * rms_norm, ggml_tensor * mul_tensor);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 263688363..72d0fe2cb 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5198,6 +5198,67 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// residual ADD(s) -> RMS_NORM -> MUL: on sm_60 with GGML_CUDA_P60_MMVQ=1 these fuse into one kernel that stores the
++// sum and the normalized output (and, for 2+ tokens, the mmvq-p60 activation layout read by the matmul)
++struct test_p60_add_norm : public test_case {
++    const int nadd;
++    const int64_t n_tokens;
++    const bool matmul;
++
++    std::string vars() override {
++        return VARS_TO_STR3(nadd, n_tokens, matmul);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "P60_ADD_NORM";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_p60_add_norm(int nadd = 1, int64_t n_tokens = 1, bool matmul = false)
++        : nadd(nadd), n_tokens(n_tokens), matmul(matmul) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t k = 2048;
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
++        ggml_set_name(b, "b");
++        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
++        ggml_set_name(c, "c");
++        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++        ggml_set_name(w, "w");
++
++        ggml_tensor * sum = ggml_add(ctx, a, b);
++        if (nadd == 2) {
++            sum = ggml_add(ctx, sum, c);
++        }
++        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, sum, 1e-6f), w);
++        ggml_tensor * out;
++        if (matmul) {
++            ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, k, 512, 16);
++            ggml_set_name(as, "as");
++            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 16, n_tokens);
++            ggml_set_name(ids, "ids");
++            ids = ggml_view_2d(ctx, ids, 4, n_tokens, ids->nb[1], 0);
++            out = ggml_mul_mat_id(ctx, as, ggml_reshape_3d(ctx, normed, k, 1, n_tokens), ids);
++        } else {
++            out = ggml_add(ctx, normed, sum); // checks both stored outputs
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, 16);
++    }
++};
++
+ // SWIGLU feeding a matmul (ffn_down): on sm_60 with GGML_CUDA_P60_MMVQ=1 the fused swiglu fills the mmvq-p60
+ // activation cache with one row per expert slot, and the matmul reads it from there
+ struct test_p60_glu_matmul : public test_case {
+@@ -10013,6 +10074,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 4, 128, {2, 3}));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+ 
++    // mmvq-p60: residual adds fused into the RMS norm that follows
++    for (int nadd : { 1, 2 }) {
++        for (int64_t nt : { 1, 3 }) {
++            test_cases.emplace_back(new test_p60_add_norm(nadd, nt, false));
++            test_cases.emplace_back(new test_p60_add_norm(nadd, nt, true));
++        }
++    }
++
+     // mmvq-p60: fused swiglu filling the activation cache for ffn_down
+     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+         for (int64_t nt : { 1, 3 }) {
+-- 
+2.56.0
+

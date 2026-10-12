@@ -1,0 +1,158 @@
+From d08e41217114a61b78d039498bd36f62016d1f51 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 12:16:32 -0400
+Subject: [PATCH 23/31] cuda : 16-byte activation loads in the sm_60
+ multi-token q8_0 dots
+
+The fp16 activation rows of the GDN, attention and output-layer kernels get 8 halves of padding per 64 elements
+instead of 4 (px8 / pp8), so every 32-element block starts 16 B aligned and dot_q8h reads x with 4 uint4 loads per
+token and block instead of 8 uint2 ones; the 8 lanes of a 128-bit load phase still hit disjoint bank quads. Same
+products in the same order: output unchanged (wikitext PPL identical to the last digit). The MoE kernel keeps its
+layout (it is at the 48 KB shared-memory limit).
+
+Output layer at 6 tokens: 1529 -> 1510 us; MTP prod sampler, 8 prompts x 256: 171.0 -> 171.8 t/s.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/p60-fa.cu     |  4 ++--
+ ggml/src/ggml-cuda/p60-mega-t.cu | 10 +++++-----
+ ggml/src/ggml-cuda/p60-mt.cuh    | 24 ++++++++++++++++--------
+ 3 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/p60-fa.cu b/ggml/src/ggml-cuda/p60-fa.cu
+index 53fb66703..2ed32b31b 100644
+--- a/ggml/src/ggml-cuda/p60-fa.cu
++++ b/ggml/src/ggml-cuda/p60-fa.cu
+@@ -263,7 +263,7 @@ namespace at {
+ using namespace p60mt;
+ 
+ constexpr int D = 2048, NQ = 16, NKV = 2, HD = 256, QF = NQ * 2 * HD, KVN = NKV * HD, O = NQ * HD;
+-constexpr int XS = D + D / 16, HALF = 1088, Q8_ROW_D = D / 32 * 34, Q8_ROW_O = O / 32 * 34;
++constexpr int XS = D + D / 8, HALF = 1088, Q8_ROW_D = D / 32 * 34, Q8_ROW_O = O / 32 * 34;
+ constexpr int NROW1 = QF + 2 * KVN; // q (+gate), k, v rows
+ 
+ struct PreParams {
+@@ -460,7 +460,7 @@ __global__ void __launch_bounds__(NT, 1) attn_post_kernel(const PostParams P) {
+             for (int i = 0; i < 16; i++) {
+                 const float vv[4] = {xv[i].x, xv[i].y, xv[i].z, xv[i].w};
+ #pragma unroll
+-                for (int c = 0; c < 4; c++) xs16[t * XS + pp(64 * lane + 4 * i + c)] = __float2half(vv[c]);
++                for (int c = 0; c < 4; c++) xs16[t * XS + pp8(64 * lane + 4 * i + c)] = __float2half(vv[c]);
+             }
+         }
+         __syncthreads();
+diff --git a/ggml/src/ggml-cuda/p60-mega-t.cu b/ggml/src/ggml-cuda/p60-mega-t.cu
+index bcdb8fee4..38a19c3bd 100644
+--- a/ggml/src/ggml-cuda/p60-mega-t.cu
++++ b/ggml/src/ggml-cuda/p60-mega-t.cu
+@@ -417,7 +417,7 @@ using namespace mt;
+ constexpr int D = 2048;
+ constexpr int HK = 16, HV = 32, SD = 128, QKV = 2 * HK * SD + HV * SD, VD = HV * SD;
+ constexpr int Q8_ROW_D = D / 32 * 34, Q8_ROW_V = VD / 32 * 34, HALF = 1088;
+-constexpr int XS = D + D / 16;                         // padded fp16 row (also one K half of ssm_out's input)
++constexpr int XS = D + D / 8;                          // padded fp16 row, px8 layout (also one K half of ssm_out's input)
+ 
+ struct Layer {
+     const float * norm; const uint8_t * qkv; const uint8_t * z; const float * alpha; const float * beta;
+@@ -461,7 +461,7 @@ __global__ void __launch_bounds__(NT, 1) gdn_t_kernel(const Params P) {
+         for (int i = 0; i < D / 128; i++) {
+             const float4 v = __ldg((const float4 *) (w + 128 * i) + lane);
+ #pragma unroll
+-            for (int t = 0; t < TM; t++) if (t < T) acc[t] += dot4(v, ld4h(xs16 + t * XS + px(128 * i + 4 * lane)));
++            for (int t = 0; t < TM; t++) if (t < T) acc[t] += dot4(v, ld4h(xs16 + t * XS + px8(128 * i + 4 * lane)));
+         }
+         int t;
+         const float a = wsum_multi<T>(acc, lane, t);
+@@ -591,7 +591,7 @@ __global__ void __launch_bounds__(NT, 1) gdn_t_kernel(const Params P) {
+ #pragma unroll
+             for (int r = 0; r < 4; r++) {
+                 const int i = 32 * r + lane;
+-                on16[t * XS + pp((p % 16) * SD + i)] = __float2half(v[r] * inv * __ldg(W.snorm + i) * silu(z[r]));
++                on16[t * XS + pp8((p % 16) * SD + i)] = __float2half(v[r] * inv * __ldg(W.snorm + i) * silu(z[r]));
+             }
+         }
+         __syncthreads();
+@@ -640,7 +640,7 @@ __global__ void __launch_bounds__(NT, 1) gdn_t_kernel(const Params P) {
+ namespace q8t {
+ using namespace mt;
+ 
+-constexpr int K = 2048, XS = K + K / 16, HALF = 1088;
++constexpr int K = 2048, XS = K + K / 8, HALF = 1088; // px8 layout
+ 
+ template <int T>
+ __global__ void __launch_bounds__(NT, 1) q8_0_t_kernel(const uint8_t * __restrict__ W, const int64_t nb01, const int nrows,
+@@ -666,7 +666,7 @@ __global__ void __launch_bounds__(NT, 1) q8_0_t_kernel(const uint8_t * __restric
+         for (int i = 0; i < 16; i++) {
+             const float v[4] = {xv[i].x, xv[i].y, xv[i].z, xv[i].w};
+ #pragma unroll
+-            for (int c = 0; c < 4; c++) xs16[t * XS + pp(k0 + 4 * i + c)] = __float2half(v[c] * sc);
++            for (int c = 0; c < 4; c++) xs16[t * XS + pp8(k0 + 4 * i + c)] = __float2half(v[c] * sc);
+         }
+         if (lane == 0) inv[t] = 1.f / sc;
+     }
+diff --git a/ggml/src/ggml-cuda/p60-mt.cuh b/ggml/src/ggml-cuda/p60-mt.cuh
+index 20c03bc24..f00059b59 100644
+--- a/ggml/src/ggml-cuda/p60-mt.cuh
++++ b/ggml/src/ggml-cuda/p60-mt.cuh
+@@ -31,6 +31,11 @@ __device__ __forceinline__ void stage_row(uint8_t * dst, const uint8_t * src, in
+     __syncwarp();
+ }
+ 
++// 8 halves of padding per 64 elements instead of 4: every 32-element block starts 16 B aligned (uint4 loads of x in
++// dot_q8h), and the 8 lanes of a 128-bit load phase still hit disjoint bank quads. Rows of this layout are D + D / 8 long.
++__device__ __forceinline__ int px8(int k) { return k + 8 * (k >> 6); }
++__device__ __forceinline__ int pp8(int k) { const int g = k & 3; return px8((k & ~3) | ((g & 1) << 1) | (g >> 1)); }
++
+ // position of element k in a pre-permuted fp16 row (then px padding)
+ __device__ __forceinline__ int pp(int k) { const int g = k & 3; return px((k & ~3) | ((g & 1) << 1) | (g >> 1)); }
+ 
+@@ -94,7 +99,8 @@ __device__ __forceinline__ void dot_q8h_T(const uint8_t * stage, int blk, int xb
+ }
+ 
+ 
+-// compile-time T version of dot_q8h_T: no per-token branches, so the compiler interleaves the tokens' chains
++// compile-time T version of dot_q8h_T for x in the px8 layout: no per-token branches, so the compiler interleaves the
++// tokens' chains, and x comes in 16 B loads
+ template <int T>
+ __device__ __forceinline__ void dot_q8h(const uint8_t * stage, int blk, int xblk, const __half * x16, int stride, float acc[TM]) {
+     const uint8_t * b = stage + 34 * blk;
+@@ -109,19 +115,21 @@ __device__ __forceinline__ void dot_q8h(const uint8_t * stage, int blk, int xblk
+         w02[i] = __hsub2(*(const half2 *) &a02, off);
+         w13[i] = __hsub2(*(const half2 *) &a13, off);
+     }
+-    const int xo = px(32 * xblk);
++    const int xo = px8(32 * xblk);
+ #pragma unroll
+     for (int t = 0; t < T; t++) {
+-        const __half * xb = x16 + t * stride + xo;
++        const uint4 * xb = (const uint4 *) (x16 + t * stride + xo);
+         float f = 0.f;
+ #pragma unroll
+         for (int h = 0; h < 2; h++) {
+             half2 a0 = __float2half2_rn(0.f), a1 = a0; // two chains: half the dependency depth
+ #pragma unroll
+-            for (int i = 4 * h; i < 4 * h + 4; i++) {
+-                const uint2 x = *(const uint2 *) (xb + 4 * i);
+-                a0 = __hfma2(w02[i], *(const half2 *) &x.x, a0);
+-                a1 = __hfma2(w13[i], *(const half2 *) &x.y, a1);
++            for (int j = 2 * h; j < 2 * h + 2; j++) {
++                const uint4 x = xb[j];
++                a0 = __hfma2(w02[2 * j],     *(const half2 *) &x.x, a0);
++                a1 = __hfma2(w13[2 * j],     *(const half2 *) &x.y, a1);
++                a0 = __hfma2(w02[2 * j + 1], *(const half2 *) &x.z, a0);
++                a1 = __hfma2(w13[2 * j + 1], *(const half2 *) &x.w, a1);
+             }
+             f += h2sum(__hadd2(a0, a1));
+         }
+@@ -152,7 +160,7 @@ __device__ __forceinline__ void norm_T(const float * x_in, const float * w, floa
+ #pragma unroll
+             for (int c = 0; c < 4; c++) {
+                 const __half h = __float2half(v[c]);
+-                xs16[t * XS + pp(k0 + 4 * i + c)] = h;
++                xs16[t * XS + pp8(k0 + 4 * i + c)] = h;
+                 if (i < 8) s0 += __half2float(h); else s1 += __half2float(h);
+             }
+         }
+-- 
+2.56.0
+

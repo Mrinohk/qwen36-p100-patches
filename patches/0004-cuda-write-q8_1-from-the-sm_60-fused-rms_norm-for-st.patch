@@ -1,0 +1,191 @@
+From 9247156a56cbe33a013139cc397a29fbc79efd70 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 10:57:43 -0400
+Subject: [PATCH 04/31] cuda : write q8_1 from the sm_60 fused rms_norm for
+ stock MMVQ
+
+The fused norm also writes the q8_1 blocks of its output into the q8_1
+cache, so the stock matvecs that read it skip quantize_q8_1. The q8_1
+cache also hits for a contiguous view of a contiguous cached tensor at
+the same address (MUL_MAT_ID reads the norm output through a reshape).
+GGML_CUDA_P60_FUSE_Q8=0 disables it.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/mmvq-p60.cu | 85 +++++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/mmvq.cu     | 14 +++++-
+ 2 files changed, 80 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cu b/ggml/src/ggml-cuda/mmvq-p60.cu
+index c63ae5178..e673e4955 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cu
++++ b/ggml/src/ggml-cuda/mmvq-p60.cu
+@@ -539,11 +539,12 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+ // matvecs that read this output skip mmvq_p60_prep_x. With adds, the sum (the residual stream) is stored too.
+ // Thread (k, l) owns the same 2 values as in mmvq_p60_prep_x and reads them before anything is written, so the
+ // outputs may alias the inputs. The sum is (x0 + x1) + x2, the graph's order. One block per row.
+-template <int NADD, bool PREP>
++template <int NADD, bool PREP, bool Q8>
+ static __global__ void __launch_bounds__(1024) p60_add_rms_norm_mul(
+         const float * x0, const float * x1, const float * x2, const int64_t stride_row, float * sum,
+         const float * __restrict__ w, float * dst,
+-        half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale, const float eps) {
++        half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale, block_q8_1 * __restrict__ q8,
++        const float eps) {
+     constexpr int ncols = 2048;
+     constexpr int lpr   = ncols/64;
+     const int k = threadIdx.x, l = threadIdx.y, row = blockIdx.x;
+@@ -578,6 +579,25 @@ static __global__ void __launch_bounds__(1024) p60_add_rms_norm_mul(
+     const float yb = b*rs*w[c1];
+     dst[row*ncols + c0] = ya;
+     dst[row*ncols + c1] = yb;
++
++    if constexpr (Q8) {
++        // stock quantize_q8_1 layout for MMVQ: a block of 32 is held by 16 lanes, 2 values each
++        float qmax = fmaxf(fabsf(ya), fabsf(yb));
++        float qsum = ya + yb;
++#pragma unroll
++        for (int off = 8; off > 0; off >>= 1) {
++            qmax = fmaxf(qmax, __shfl_xor_sync(0xffffffff, qmax, off));
++            qsum += __shfl_xor_sync(0xffffffff, qsum, off);
++        }
++        const float d = qmax / 127.0f;
++        block_q8_1 * blk = q8 + row*(ncols/QK8_1) + 2*l + (k >> 4);
++        const int iq = 4*i + (g & 1);
++        blk->qs[iq]     = qmax == 0.0f ? 0 : roundf(ya / d);
++        blk->qs[iq + 2] = qmax == 0.0f ? 0 : roundf(yb / d);
++        if ((k & 15) == 0) {
++            blk->ds = make_half2(d, qsum);
++        }
++    }
+     if constexpr (!PREP) {
+         return;
+     }
+@@ -611,10 +631,11 @@ static bool p60_env_on(const char * name) {
+ // x[0..nadd] are summed (nadd adds) into sum_dst, then normalized into mul_tensor. Prep is written only for 2+ rows
+ // (the token-count policy: with one token the matvecs that read a norm output stay on stock MMVQ).
+ static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * const * x, const int nadd, ggml_tensor * sum_dst,
+-        const ggml_tensor * rms_norm, ggml_tensor * mul_tensor, const bool need_prep) {
++        const ggml_tensor * rms_norm, ggml_tensor * mul_tensor, const bool need_extra) {
+     static const bool enabled = getenv("GGML_CUDA_P60_MMVQ") != nullptr && atoi(getenv("GGML_CUDA_P60_MMVQ")) != 0;
+     static const bool all     = getenv("GGML_CUDA_P60_ALL")  != nullptr && atoi(getenv("GGML_CUDA_P60_ALL"))  != 0;
+     static const bool prep_on = p60_env_on("GGML_CUDA_P60_FUSE_NORM");
++    static const bool q8_on   = p60_env_on("GGML_CUDA_P60_FUSE_Q8");
+     if (!enabled) {
+         return false;
+     }
+@@ -657,13 +678,12 @@ static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         }
+     }
+ 
+-    const bool prep = prep_on && (nrows >= 2 || all);
+-    if (need_prep && !prep) {
+-        return false; // a plain RMS norm * weight: stock does the same work
+-    }
+     cudaStream_t stream = ctx.stream();
+-    if (prep && !p60_cache_usable(ctx, stream)) {
+-        return false;
++    const bool prep = prep_on && (nrows >= 2 || all) && p60_cache_usable(ctx, stream);
++    // stock MMVQ (the dense matvecs, and everything with one token) reads q8_1: write it into the q8_1 cache
++    const bool q8 = q8_on && (ctx.q8_1_cache_stream == nullptr || ctx.q8_1_cache_stream == stream);
++    if (need_extra && !prep && !q8) {
++        return false; // a plain RMS norm * weight: stock does the same work
+     }
+ 
+     char * pr = nullptr;
+@@ -674,6 +694,29 @@ static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         pr = p60_cache_claim(ctx, mul_tensor, mul_tensor->data, stream, nrows, mul_tensor->nb[1] / sizeof(float), 2048, prep_bytes);
+     }
+ 
++    block_q8_1 * q81 = nullptr;
++    if (q8) {
++        // the key ggml_cuda_mul_mat_vec_q computes for src1 == mul_tensor (2048 needs no row padding)
++        const size_t q8_1_size = nrows*2048*sizeof(block_q8_1)/QK8_1;
++        if (q8_1_size > ctx.q8_1_cache_cap) {
++            if (ctx.q8_1_cache_mem != nullptr) {
++                CUDA_CHECK(cudaFree(ctx.q8_1_cache_mem)); // only this buffer: q8_1_cache_free() also frees the p60 slots
++            }
++            ggml_cuda_set_device(ctx.device);
++            CUDA_CHECK(cudaMalloc((void **) &ctx.q8_1_cache_mem, q8_1_size));
++            ctx.q8_1_cache_cap = q8_1_size;
++        }
++        q81 = (block_q8_1 *) ctx.q8_1_cache_mem;
++        ctx.q8_1_cache_src1   = mul_tensor;
++        ctx.q8_1_cache_data   = mul_tensor->data;
++        ctx.q8_1_cache_stream = stream;
++        ctx.q8_1_cache_size   = q8_1_size;
++        ctx.q8_1_cache_s[0]   = 2048;
++        ctx.q8_1_cache_s[1]   = mul_tensor->nb[1] / sizeof(float);
++        ctx.q8_1_cache_s[2]   = mul_tensor->nb[2] / sizeof(float);
++        ctx.q8_1_cache_s[3]   = mul_tensor->nb[3] / sizeof(float);
++    }
++
+     float eps = 0.0f;
+     memcpy(&eps, rms_norm->op_params, sizeof(float));
+     const float * x0 = (const float *) x[0]->data;
+@@ -685,14 +728,20 @@ static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     float  * is = prep ? (float  *) (pr + xp_bytes + ss_bytes) : nullptr;
+     const int64_t sr = x[0]->nb[1] / sizeof(float);
+     const dim3 grid(nrows), block(32, 32);
+-#define P60_NORM_LAUNCH(N, P) p60_add_rms_norm_mul<N, P><<<grid, block, 0, stream>>>(x0, x1, x2, sr, sum, (const float *) w->data, (float *) mul_tensor->data, xp, ss, is, eps)
+-    switch (nadd*2 + (prep ? 1 : 0)) {
+-        case 0: P60_NORM_LAUNCH(0, false); break;
+-        case 1: P60_NORM_LAUNCH(0, true);  break;
+-        case 2: P60_NORM_LAUNCH(1, false); break;
+-        case 3: P60_NORM_LAUNCH(1, true);  break;
+-        case 4: P60_NORM_LAUNCH(2, false); break;
+-        case 5: P60_NORM_LAUNCH(2, true);  break;
++#define P60_NORM_LAUNCH(N, P, Q) p60_add_rms_norm_mul<N, P, Q><<<grid, block, 0, stream>>>(x0, x1, x2, sr, sum, (const float *) w->data, (float *) mul_tensor->data, xp, ss, is, q81, eps)
++    switch (nadd*4 + (prep ? 2 : 0) + (q8 ? 1 : 0)) {
++        case  0: P60_NORM_LAUNCH(0, false, false); break;
++        case  1: P60_NORM_LAUNCH(0, false, true);  break;
++        case  2: P60_NORM_LAUNCH(0, true,  false); break;
++        case  3: P60_NORM_LAUNCH(0, true,  true);  break;
++        case  4: P60_NORM_LAUNCH(1, false, false); break;
++        case  5: P60_NORM_LAUNCH(1, false, true);  break;
++        case  6: P60_NORM_LAUNCH(1, true,  false); break;
++        case  7: P60_NORM_LAUNCH(1, true,  true);  break;
++        case  8: P60_NORM_LAUNCH(2, false, false); break;
++        case  9: P60_NORM_LAUNCH(2, false, true);  break;
++        case 10: P60_NORM_LAUNCH(2, true,  false); break;
++        case 11: P60_NORM_LAUNCH(2, true,  true);  break;
+         default: GGML_ABORT("fatal error");
+     }
+ #undef P60_NORM_LAUNCH
+@@ -702,7 +751,7 @@ static bool p60_fused_norm(ggml_backend_cuda_context & ctx, const ggml_tensor *
+ 
+ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor) {
+     const ggml_tensor * x[1] = { rms_norm->src[0] };
+-    return p60_fused_norm(ctx, x, 0, nullptr, rms_norm, mul_tensor, /*need_prep =*/ true);
++    return p60_fused_norm(ctx, x, 0, nullptr, rms_norm, mul_tensor, /*need_extra =*/ true);
+ }
+ 
+ bool ggml_cuda_p60_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add0, ggml_tensor * add1,
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6fa7e0748..ce8397cc2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1599,7 +1599,19 @@ void ggml_cuda_mul_mat_vec_q(
+                          ctx.q8_1_cache_s[2]   == s12 &&
+                          ctx.q8_1_cache_s[3]   == s13;
+ 
+-        if (hit) {
++        // A contiguous view of a contiguous cached tensor at the same address quantizes to the same bytes
++        // (MUL_MAT_ID reads a norm output through a reshape).
++        const bool hit_view = !hit && cacheable &&
++                         ctx.q8_1_cache_mem != nullptr &&
++                         src1->view_src != nullptr &&
++                         ctx.q8_1_cache_src1   == src1->view_src &&
++                         ctx.q8_1_cache_data   == src1->data &&
++                         ctx.q8_1_cache_stream == stream &&
++                         ctx.q8_1_cache_size   == q8_1_size &&
++                         ctx.q8_1_cache_s[0]   == ne10_padded && ne10_padded == ne10 &&
++                         ggml_is_contiguous(src1) && ggml_is_contiguous(src1->view_src);
++
++        if (hit || hit_view) {
+             src1_q8_1_d = ctx.q8_1_cache_mem;
+         } else if (!cacheable) {
+             src1_q8_1_d = src1_q8_1_scoped.alloc(q8_1_size);
+-- 
+2.56.0
+

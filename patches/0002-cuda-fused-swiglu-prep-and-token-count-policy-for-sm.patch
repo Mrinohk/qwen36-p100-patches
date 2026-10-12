@@ -1,0 +1,482 @@
+From 814ac52aec8d253fc0629ffb82e4a1024177f6a4 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 08:45:58 -0400
+Subject: [PATCH 02/31] cuda : fused swiglu prep and token-count policy for
+ sm_60 fp16 matvec
+
+The fused swiglu writes the fp16 layout for ffn_down. With one token only the
+output layer and ffn_down take the fp16 path, other matvecs slow the rest of
+the graph more than they gain. With 2+ tokens all of them take it.
+GGML_CUDA_P60_ALL=1 takes every case. The prep cache now has 4 slots.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/common.cuh   |  43 +++---
+ ggml/src/ggml-cuda/mmvq-p60.cu  | 226 +++++++++++++++++++++++---------
+ ggml/src/ggml-cuda/mmvq-p60.cuh |   4 +
+ ggml/src/ggml-cuda/unary.cu     |   4 +
+ tests/test-backend-ops.cpp      |  59 +++++++++
+ 5 files changed, 258 insertions(+), 78 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 5fb58497e..5005f98a0 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1487,15 +1487,20 @@ struct ggml_backend_cuda_context {
+     size_t              q8_1_cache_size   = 0;
+     int64_t             q8_1_cache_s[4]   = { 0, 0, 0, 0 };
+ 
+-    // Same idea for the fp16 activations of mmvq-p60 (sm_60 single-token matvec): one slot, keyed
+-    // on the src1 tensor, its data pointer, stream and channel count; same lifetime rules.
+-    char *              p60_x_cache_mem    = nullptr;
+-    size_t              p60_x_cache_cap    = 0;
+-    const ggml_tensor * p60_x_cache_src1   = nullptr;
+-    const void *        p60_x_cache_data   = nullptr;
+-    cudaStream_t        p60_x_cache_stream = nullptr;
+-    int64_t             p60_x_cache_nch    = 0;
+-    int64_t             p60_x_cache_s[2]   = { 0, 0 };
++    // Same idea for the fp16 activations of mmvq-p60 (sm_60 single-token matvec), with a few slots so the
++    // producers that write it (fused rms_norm, fused swiglu) do not evict each other. Same lifetime rules.
++    struct p60_x_cache_entry {
++        char *              mem    = nullptr;
++        size_t              cap    = 0;
++        const ggml_tensor * src1   = nullptr; // the tensor the matvecs read, or the one they view
++        const void *        data   = nullptr;
++        cudaStream_t        stream = nullptr;
++        int64_t             nrows  = 0;
++        int64_t             s[2]   = { 0, 0 }; // row stride, K
++    };
++    static constexpr int p60_x_cache_n = 4;
++    p60_x_cache_entry p60_x_cache[p60_x_cache_n];
++    int               p60_x_cache_next = 0;
+ 
+     // Forget the key, keep the buffer.  Called at the top of every graph computation.
+     void q8_1_cache_clear() {
+@@ -1504,10 +1509,12 @@ struct ggml_backend_cuda_context {
+         q8_1_cache_stream = nullptr;
+         q8_1_cache_size   = 0;
+ 
+-        p60_x_cache_src1   = nullptr;
+-        p60_x_cache_data   = nullptr;
+-        p60_x_cache_stream = nullptr;
+-        p60_x_cache_nch    = 0;
++        for (p60_x_cache_entry & e : p60_x_cache) {
++            e.src1   = nullptr;
++            e.data   = nullptr;
++            e.stream = nullptr;
++            e.nrows  = 0;
++        }
+     }
+ 
+     void q8_1_cache_free() {
+@@ -1516,10 +1523,12 @@ struct ggml_backend_cuda_context {
+             q8_1_cache_mem = nullptr;
+             q8_1_cache_cap = 0;
+         }
+-        if (p60_x_cache_mem != nullptr) {
+-            (void) cudaFree(p60_x_cache_mem);
+-            p60_x_cache_mem = nullptr;
+-            p60_x_cache_cap = 0;
++        for (p60_x_cache_entry & e : p60_x_cache) {
++            if (e.mem != nullptr) {
++                (void) cudaFree(e.mem);
++                e.mem = nullptr;
++                e.cap = 0;
++            }
+         }
+         q8_1_cache_clear();
+     }
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cu b/ggml/src/ggml-cuda/mmvq-p60.cu
+index 58d417fb4..46961cf4b 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cu
++++ b/ggml/src/ggml-cuda/mmvq-p60.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq-p60.cuh"
++#include "unary.cuh"
+ 
+ // A row has NSB superblocks. Lane slot L = sb*4 + q reads superblock sb, quarter q (64 weights, sub-blocks 2q and 2q+1),
+ // so LPR = 4*NSB lanes cover a row and a warp does 32/LPR rows per pass.
+@@ -359,6 +360,50 @@ static void mmvq_p60_launch(const char * vx, const char * prep, const size_t xp_
+         ids, dst, nb01, nb02, n_used, ids_stride, ne11, s1, s2);
+ }
+ 
++// Prep cache (ctx.p60_x_cache): a few slots keyed on the tensor the matvecs read (or view), its data
++// pointer, the stream, the row count, row stride and K. Rows of a cached prep are always evenly spaced.
++static bool p60_cache_usable(const ggml_backend_cuda_context & ctx, cudaStream_t stream) {
++    for (const auto & e : ctx.p60_x_cache) {
++        if (e.stream != nullptr && e.stream != stream) {
++            return false; // a buffer written on another stream would need an event
++        }
++    }
++    return true;
++}
++
++static char * p60_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * base, const void * data,
++        cudaStream_t stream, int64_t nrows, int64_t row_stride, int64_t k) {
++    for (auto & e : ctx.p60_x_cache) {
++        if (e.mem != nullptr && e.src1 == base && e.data == data && e.stream == stream &&
++                e.nrows == nrows && e.s[0] == row_stride && e.s[1] == k) {
++            return e.mem;
++        }
++    }
++    return nullptr;
++}
++
++static char * p60_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * base, const void * data,
++        cudaStream_t stream, int64_t nrows, int64_t row_stride, int64_t k, size_t bytes) {
++    auto & e = ctx.p60_x_cache[ctx.p60_x_cache_next];
++    ctx.p60_x_cache_next = (ctx.p60_x_cache_next + 1) % ctx.p60_x_cache_n;
++    if (bytes > e.cap) {
++        if (e.mem != nullptr) {
++            CUDA_CHECK(cudaFree(e.mem));
++        }
++        ggml_cuda_set_device(ctx.device);
++        CUDA_CHECK(cudaMalloc((void **) &e.mem, bytes));
++        e.cap = bytes;
++    }
++    e.src1 = base; e.data = data; e.stream = stream; e.nrows = nrows; e.s[0] = row_stride; e.s[1] = k;
++    return e.mem;
++}
++
++static size_t p60_prep_bytes(int64_t nrows, int lpr, size_t * xp_bytes, size_t * ss_bytes) {
++    *xp_bytes = nrows*lpr*32*sizeof(half2);
++    *ss_bytes = nrows*lpr*sizeof(float2);
++    return *xp_bytes + *ss_bytes + nrows*sizeof(float);
++}
++
+ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -412,6 +457,15 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+     } else if (ne1 != 1 || ne11 != 1 || ne02 != 1 || ne12 != 1 || ne03 != 1 || ne13 != 1) {
+         return false;
+     }
++    // One token: in a full graph only the output layer and ffn_down (K = 512) gain; the other matvecs slow
++    // unrelated kernels more than they save. With 2+ tokens (speculative verify) all of them gain.
++    // GGML_CUDA_P60_ALL=1 takes every supported case.
++    static const bool all = getenv("GGML_CUDA_P60_ALL") != nullptr && atoi(getenv("GGML_CUDA_P60_ALL")) != 0;
++    const int64_t n_tok = ids ? ne2 : ne11;
++    if (!all && n_tok == 1 && ne01 < 100000 && ne00 != 512) {
++        return false;
++    }
++
+     const int     lpr     = ne00/64;
+     const int64_t nrows_y = ids ? ne11*ne12 : ne11;
+     const int64_t s11 = nb11 / sizeof(float);
+@@ -419,49 +473,25 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+-    // gate and up share src1: reuse the prep, same rules as the q8_1 cache in mmvq.cu.
+-    // One x row per expert slot (ffn_down) is never shared, so it does not evict the cache.
+-    const size_t xp_bytes   = nrows_y*lpr*32*sizeof(half2);
+-    const size_t ss_bytes   = nrows_y*lpr*sizeof(float2);
+-    const size_t prep_bytes = xp_bytes + ss_bytes + nrows_y*sizeof(float);
+-    ggml_cuda_pool_alloc<char> prep_scoped(ctx.pool());
+-    char * prep = nullptr;
+-
++    // gate and up share src1, ffn_down reads the fused swiglu output: reuse the prep when it is cached.
+     // Key on the viewed tensor, so the routed experts (MUL_MAT_ID on a reshape) and the shared expert (MUL_MAT) share it.
+-    // Cached rows are always evenly spaced: by s12 for MUL_MAT_ID with ne11 == 1, by s11 for MUL_MAT.
++    size_t xp_bytes, ss_bytes;
++    const size_t prep_bytes = p60_prep_bytes(nrows_y, lpr, &xp_bytes, &ss_bytes);
+     const ggml_tensor * base = src1->view_src ? src1->view_src : src1;
+-    const int64_t row_stride = ids ? s12 : s11;
+-    const bool cacheable = (!ids || ne11 == 1) && (ctx.p60_x_cache_stream == nullptr || ctx.p60_x_cache_stream == stream);
+-    const bool hit = cacheable &&
+-                     ctx.p60_x_cache_mem    != nullptr &&
+-                     ctx.p60_x_cache_src1   == base &&
+-                     ctx.p60_x_cache_data   == src1->data &&
+-                     ctx.p60_x_cache_stream == stream &&
+-                     ctx.p60_x_cache_nch    == nrows_y &&
+-                     ctx.p60_x_cache_s[0]   == row_stride &&
+-                     ctx.p60_x_cache_s[1]   == ne00;
+-    if (hit) {
+-        prep = ctx.p60_x_cache_mem;
+-    } else {
+-        if (!cacheable) {
+-            prep = prep_scoped.alloc(prep_bytes);
+-        } else {
+-            if (prep_bytes > ctx.p60_x_cache_cap) {
+-                if (ctx.p60_x_cache_mem != nullptr) {
+-                    CUDA_CHECK(cudaFree(ctx.p60_x_cache_mem));
+-                }
+-                ggml_cuda_set_device(ctx.device);
+-                CUDA_CHECK(cudaMalloc((void **) &ctx.p60_x_cache_mem, prep_bytes));
+-                ctx.p60_x_cache_cap = prep_bytes;
+-            }
+-            prep = ctx.p60_x_cache_mem;
+-            ctx.p60_x_cache_src1   = base;
+-            ctx.p60_x_cache_data   = src1->data;
+-            ctx.p60_x_cache_stream = stream;
+-            ctx.p60_x_cache_nch    = nrows_y;
+-            ctx.p60_x_cache_s[0]   = row_stride;
+-            ctx.p60_x_cache_s[1]   = ne00;
+-        }
++    int64_t row_stride = -1; // rows evenly spaced, else not cacheable
++    if (!ids) {
++        row_stride = s11;
++    } else if (ne11 == 1) {
++        row_stride = s12;
++    } else if (s12 == ne11*s11) {
++        row_stride = s11;
++    }
++    const bool cacheable = row_stride >= 0 && p60_cache_usable(ctx, stream);
++    ggml_cuda_pool_alloc<char> prep_scoped(ctx.pool());
++    char * prep = cacheable ? p60_cache_find(ctx, base, src1->data, stream, nrows_y, row_stride, ne00) : nullptr;
++    if (prep == nullptr) {
++        prep = cacheable ? p60_cache_claim(ctx, base, src1->data, stream, nrows_y, row_stride, ne00, prep_bytes)
++                         : prep_scoped.alloc(prep_bytes);
+         mmvq_p60_prep_x<<<nrows_y, dim3(32, std::min(lpr, 32)), 0, stream>>>(
+             (const float *) src1->data, (half2 *) prep, is_q8_0 && !cacheable ? nullptr : (float2 *) (prep + xp_bytes),
+             (float *) (prep + xp_bytes + ss_bytes), lpr, ne11, s11, s12);
+@@ -574,29 +604,22 @@ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tens
+     const int64_t nrows = src->ne[1];
+     if (src->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 ||
+             src->ne[0] != 2048 || src->ne[2] != 1 || src->ne[3] != 1 || nrows > 8 || src->nb[0] != sizeof(float) ||
++            (nrows == 1 && (getenv("GGML_CUDA_P60_ALL") == nullptr || atoi(getenv("GGML_CUDA_P60_ALL")) == 0)) ||
+             w->ne[0] != 2048 || ggml_nelements(w) != 2048 || !ggml_is_contiguous(w) ||
+             !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(src, mul_tensor)) {
+         return false;
+     }
+ 
+     cudaStream_t stream = ctx.stream();
+-    if (ctx.p60_x_cache_stream != nullptr && ctx.p60_x_cache_stream != stream) {
++    if (!p60_cache_usable(ctx, stream)) {
+         return false;
+     }
+ 
++    // same key the matvecs compute for this tensor: MUL_MAT reads it directly, MUL_MAT_ID through a reshape view
+     constexpr int lpr = 2048/64;
+-    const size_t xp_bytes   = nrows*lpr*32*sizeof(half2);
+-    const size_t ss_bytes   = nrows*lpr*sizeof(float2);
+-    const size_t prep_bytes = xp_bytes + ss_bytes + nrows*sizeof(float);
+-    if (prep_bytes > ctx.p60_x_cache_cap) {
+-        if (ctx.p60_x_cache_mem != nullptr) {
+-            CUDA_CHECK(cudaFree(ctx.p60_x_cache_mem));
+-        }
+-        ggml_cuda_set_device(ctx.device);
+-        CUDA_CHECK(cudaMalloc((void **) &ctx.p60_x_cache_mem, prep_bytes));
+-        ctx.p60_x_cache_cap = prep_bytes;
+-    }
+-    char * prep = ctx.p60_x_cache_mem;
++    size_t xp_bytes, ss_bytes;
++    const size_t prep_bytes = p60_prep_bytes(nrows, lpr, &xp_bytes, &ss_bytes);
++    char * prep = p60_cache_claim(ctx, mul_tensor, mul_tensor->data, stream, nrows, mul_tensor->nb[1] / sizeof(float), 2048, prep_bytes);
+ 
+     float eps = 0.0f;
+     memcpy(&eps, rms_norm->op_params, sizeof(float));
+@@ -604,13 +627,94 @@ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tens
+         (const float *) src->data, src->nb[1] / sizeof(float), (const float *) w->data, (float *) mul_tensor->data,
+         (half2 *) prep, (float2 *) (prep + xp_bytes), (float *) (prep + xp_bytes + ss_bytes), eps);
+     CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+ 
+-    // same key the matvecs compute for this tensor: MUL_MAT reads it directly, MUL_MAT_ID through a reshape view
+-    ctx.p60_x_cache_src1   = mul_tensor;
+-    ctx.p60_x_cache_data   = mul_tensor->data;
+-    ctx.p60_x_cache_stream = stream;
+-    ctx.p60_x_cache_nch    = nrows;
+-    ctx.p60_x_cache_s[0]   = mul_tensor->nb[1] / sizeof(float);
+-    ctx.p60_x_cache_s[1]   = 2048;
++// silu(gate) * up for rows of K = 64*lpr that also writes the mmvq-p60 x layout, so ffn_down skips
++// mmvq_p60_prep_x. Same thread mapping as p60_rms_norm_mul. One block per row, blockDim = (32, lpr).
++static __global__ void __launch_bounds__(1024) p60_swiglu(
++        const char * __restrict__ gate, const char * __restrict__ up, float * __restrict__ dst, const int64_t ne1,
++        const int64_t g1, const int64_t g2, const int64_t u1, const int64_t u2,
++        half2 * __restrict__ xp, float2 * __restrict__ ss, float * __restrict__ inv_scale) {
++    const int k = threadIdx.x, l = threadIdx.y, lpr = blockDim.y, row = blockIdx.x;
++    const int g = k >> 3, i = k & 7;
++    const int c0 = 64*l + (g >= 2 ? 32 : 0) + 4*i + (g & 1);
++    const int c1 = c0 + 2;
++    const int64_t i1 = row % ne1, i2 = row / ne1;
++    const float * gr = (const float *) (gate + i1*g1 + i2*g2);
++    const float * ur = (const float *) (up   + i1*u1 + i2*u2);
++
++    const float ya = ggml_cuda_op_silu_single(gr[c0]) * ur[c0];
++    const float yb = ggml_cuda_op_silu_single(gr[c1]) * ur[c1];
++    dst[(int64_t) row*64*lpr + c0] = ya;
++    dst[(int64_t) row*64*lpr + c1] = yb;
++
++    __shared__ float red[32];
++    float amax = warp_reduce_max(fmaxf(fabsf(ya), fabsf(yb)));
++    if (k == 0) {
++        red[l] = amax;
++    }
++    __syncthreads();
++    amax = warp_reduce_max(k < lpr ? red[k] : 0.0f);
++    int e = 0;
++    frexpf(amax, &e);
++    const float scale = amax > 0.0f ? ldexpf(1.0f, 5 - e) : 1.0f;
++    if (l == 0 && k == 0) {
++        inv_scale[row] = 1.0f / scale;
++    }
++    xp[(row*lpr + l)*32 + k] = __floats2half2_rn(ya*scale, yb*scale);
++    const float lo = warp_reduce_sum(k < 16 ? ya + yb : 0.0f);
++    const float hi = warp_reduce_sum(k < 16 ? 0.0f : ya + yb);
++    if (k == 0) {
++        ss[row*lpr + l] = make_float2(lo, hi);
++    }
++}
++
++bool ggml_cuda_p60_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    static const bool enabled = [] {
++        const char * e = getenv("GGML_CUDA_P60_MMVQ");
++        const char * f = getenv("GGML_CUDA_P60_FUSE_GLU");
++        return e != nullptr && atoi(e) != 0 && (f == nullptr || atoi(f) != 0);
++    }();
++    if (!enabled) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[ctx.device].cc;
++    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc >= GGML_CUDA_CC_DP4A) {
++        return false;
++    }
++
++    const ggml_tensor * gate = dst->src[0];
++    const ggml_tensor * up   = dst->src[1];
++    const int64_t K     = dst->ne[0];
++    const int64_t nrows = ggml_nrows(dst);
++    // only the routed experts: their ffn_down is a MUL_MAT_ID that mmvq-p60 takes, the shared expert's is a small stock matmul
++    const ggml_tensor * gate_src = gate->view_src ? gate->view_src : gate;
++    if (gate_src->op != GGML_OP_MUL_MAT_ID) {
++        return false;
++    }
++    if (up == nullptr || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++            K % 64 != 0 || K > 2048 || nrows > 64 || dst->ne[3] != 1 || !ggml_is_contiguous(dst) ||
++            gate->nb[0] != sizeof(float) || up->nb[0] != sizeof(float) ||
++            !ggml_are_same_shape(gate, dst) || !ggml_are_same_shape(up, dst)) {
++        return false;
++    }
++
++    cudaStream_t stream = ctx.stream();
++    if (!p60_cache_usable(ctx, stream)) {
++        return false;
++    }
++
++    // ffn_down reads dst directly: rows evenly spaced by K
++    const int lpr = K/64;
++    size_t xp_bytes, ss_bytes;
++    const size_t prep_bytes = p60_prep_bytes(nrows, lpr, &xp_bytes, &ss_bytes);
++    char * prep = p60_cache_claim(ctx, dst, dst->data, stream, nrows, K, K, prep_bytes);
++
++    p60_swiglu<<<nrows, dim3(32, lpr), 0, stream>>>(
++        (const char *) gate->data, (const char *) up->data, (float *) dst->data, dst->ne[1],
++        gate->nb[1], gate->nb[2], up->nb[1], up->nb[2],
++        (half2 *) prep, (float2 *) (prep + xp_bytes), (float *) (prep + xp_bytes + ss_bytes));
++    CUDA_CHECK(cudaGetLastError());
+     return true;
+ }
+diff --git a/ggml/src/ggml-cuda/mmvq-p60.cuh b/ggml/src/ggml-cuda/mmvq-p60.cuh
+index 10948a96e..cf1018e21 100644
+--- a/ggml/src/ggml-cuda/mmvq-p60.cuh
++++ b/ggml/src/ggml-cuda/mmvq-p60.cuh
+@@ -11,3 +11,7 @@ bool ggml_cuda_mmvq_p60(ggml_backend_cuda_context & ctx,
+ // Fused RMS norm * weight for 2048-wide rows that also fills the mmvq-p60 activation cache for its output.
+ // Returns false (and does nothing) if not applicable. GGML_CUDA_P60_FUSE_NORM=0 disables it.
+ bool ggml_cuda_p60_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mul_tensor);
++
++// Fused swiglu (silu(gate) * up) that also fills the mmvq-p60 activation cache for its output (the ffn_down input).
++// Returns false (and does nothing) if not applicable. GGML_CUDA_P60_FUSE_GLU=0 disables it.
++bool ggml_cuda_p60_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index d3e594878..90fb3f063 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -1,4 +1,5 @@
+ #include "unary.cuh"
++#include "mmvq-p60.cuh"
+ #include "convert.cuh"
+ 
+ static __device__ __forceinline__ float op_abs(float x) {
+@@ -346,6 +347,9 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ }
+ 
+ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_cuda_p60_swiglu(ctx, dst)) {
++        return;
++    }
+     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
+ }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fad3e166d..263688363 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5198,6 +5198,58 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++// SWIGLU feeding a matmul (ffn_down): on sm_60 with GGML_CUDA_P60_MMVQ=1 the fused swiglu fills the mmvq-p60
++// activation cache with one row per expert slot, and the matmul reads it from there
++struct test_p60_glu_matmul : public test_case {
++    const ggml_type type_a;
++    const int64_t n_tokens;
++
++    std::string vars() override {
++        return VARS_TO_STR2(type_a, n_tokens);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "P60_GLU_MATMUL";
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    test_p60_glu_matmul(ggml_type type_a = GGML_TYPE_Q5_K, int64_t n_tokens = 1)
++        : type_a(type_a), n_tokens(n_tokens) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        // gate and up come from MUL_MAT_ID like the routed experts' (the fusion is limited to that case)
++        const int64_t k_in = 64, k = 512, m = 2048, n_mats = 16, n_used = 4;
++        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_in, 1, n_tokens);
++        ggml_set_name(x, "x");
++        ggml_tensor * wg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_in, k, n_mats);
++        ggml_set_name(wg, "wg");
++        ggml_tensor * wu = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k_in, k, n_mats);
++        ggml_set_name(wu, "wu");
++        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
++        ggml_set_name(as, "as");
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
++        ggml_set_name(ids, "ids");
++        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
++
++        // up before gate, like llama-graph's build_moe_ffn (so the stock gate+up+glu fusion does not take it)
++        ggml_tensor * up   = ggml_mul_mat_id(ctx, wu, x, ids);
++        ggml_tensor * gate = ggml_mul_mat_id(ctx, wg, x, ids);
++        ggml_tensor * out  = ggml_mul_mat_id(ctx, as, ggml_swiglu_split(ctx, gate, up), ids);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, 16);
++    }
++};
++
+ // RMS_NORM * weight feeding a matmul: on sm_60 with GGML_CUDA_P60_MMVQ=1 the fused norm also fills the
+ // mmvq-p60 activation cache, and the matmul reads it from there (MUL_MAT_ID through a reshape view)
+ struct test_p60_norm_matmul : public test_case {
+@@ -9961,6 +10013,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 4, 128, {2, 3}));
+     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 512, 256)); // many rows
+ 
++    // mmvq-p60: fused swiglu filling the activation cache for ffn_down
++    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
++        for (int64_t nt : { 1, 3 }) {
++            test_cases.emplace_back(new test_p60_glu_matmul(t, nt));
++        }
++    }
++
+     // mmvq-p60: fused RMS norm filling the activation cache for the matmul that follows
+     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0 }) {
+         test_cases.emplace_back(new test_p60_norm_matmul(t, 2048, 1, false));
+-- 
+2.56.0
+

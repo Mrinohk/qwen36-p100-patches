@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B on Tesla P100: llama.cpp patches
 
-31 patches for [llama.cpp](https://github.com/ggml-org/llama.cpp) that make the Qwen3.5/3.6 MoE models (tested on
+35 patches for [llama.cpp](https://github.com/ggml-org/llama.cpp) that make the Qwen3.5/3.6 MoE models (tested on
 **Qwen3.6-35B-A3B, Unsloth UD-Q4_K_XL**) run about **2x faster on Tesla P100 (GP100, sm_60)** cards, for both
 decoding and prompt processing.
 
@@ -60,6 +60,43 @@ with stock. Wikitext-2 KL divergence of the token distributions against the stoc
 Perplexity is unchanged within its error bars. For prompt processing the patched build is closer to the reference
 than stock is (fp16 instead of int8 activations).
 
+### MTP output and a stock-exact mode (patches 32-35)
+
+Speculative decoding is meant to be lossless: the main model verifies every drafted token, so the output should be
+the same as without speculation. In llama.cpp that only holds if verifying a batch of tokens computes exactly what
+decoding them one at a time would. It does not, in stock llama.cpp either: the multi-token kernels sum in a different
+order (MoE matvec, dense matvec above 4 columns, the flash-attention tile and KV split), so greedy output with MTP
+forks from greedy output without MTP within the first few dozen tokens (stock forked at token 11 on our test prompt).
+
+- **`GGML_CUDA_P60_INVAR=1` (patch 35, recommended).** With the persistent kernels on, the 2-6 token verify kernels
+  already give the same per-token result for any batch width; single-token decode used separate fp32 kernels. INVAR
+  runs single-token steps through the verify kernels, so **output with MTP is token-identical to output without
+  MTP**: logits bit-identical for batch widths 1-6 over 160 positions on 3 prompts (across a 256-position KV
+  boundary), and identical `llama-server` output with and without MTP. Cost: about 1-3% decode speed (MTP 153 / 250 /
+  200 -> 149 / 225 / 197 t/s on 3 prompts, the middle one measured warm; without MTP ~1%). The numbers in the table
+  above were measured before patch 35.
+- **`GGML_CUDA_P60_EXACT=1` + `GGML_CUDA_P60_MEGAX=1` (patches 32-34), a reference mode.** Decode and MTP verify are
+  **bit-identical to stock llama.cpp without speculation** (logits and server output on 3 prompts), using stock-
+  equivalent kernels made batch-invariant plus an exact persistent MoE kernel. It is much slower (about 85-98 t/s
+  with MTP instead of 150-250): matching stock exactly means int8 activations and emulated int8 dot products, which
+  sm_60 has no instruction for. Use it to rule the build out when a model behaves oddly. Prompt processing in this
+  mode uses the stock kernels.
+
+How far the normal build (with INVAR) is from stock, on 3 long real-world agent prompts (~10k tokens, 394 decode
+positions teacher-forced on stock's greedy output):
+
+| | mean KLD | same top token |
+|---|---:|---:|
+| stock with MTP verify (T=6) vs stock without | 0.0025-0.0068 | 97.5-100% |
+| this build (INVAR) vs stock | 0.0090-0.0175 | 94.4-100% |
+| this build (INVAR) vs its fp32-activation decode path | 0.0004-0.0029 | 100% |
+| stock vs that fp32-activation path | 0.0081-0.0176 | 94.4-100% |
+
+The top token differed at 14 of the 394 positions, and at every one of them stock itself put less than 60% on its
+own choice (most were near 50/50, e.g. 0.51 vs 0.40); in 13 of the 14 this build picked stock's second choice. Where
+the builds agree, stock's median top-token probability is 0.999. Taking the fp32-activation path as the more
+precise reference, most of the remaining gap is stock's int8 activation rounding, not this build's.
+
 ## What changed
 
 All of it is opt-in through environment variables; without them the build behaves like the baseline.
@@ -69,6 +106,9 @@ All of it is opt-in through environment variables; without them the build behave
 | `GGML_CUDA_P60_MMVQ=1` | sm_60 fp16 matvec and the fusions below (patches 1-16). Required by everything else. |
 | `GGML_CUDA_P60_MEGA=1` | Persistent layer kernels, the MTP verify kernels and the prompt-processing kernels (patches 18-31). |
 | `LLAMA_MTP_DRAFT_VOCAB=draftvocab/dv32k.bin` | The MTP draft head scores 32k frequent tokens instead of all 248k (patch 17). |
+| `GGML_CUDA_P60_INVAR=1` | Single-token decode uses the MTP verify kernels: same output with and without MTP (patch 35). |
+| `GGML_CUDA_P60_EXACT=1` | Reference mode: decode and MTP verify bit-identical to stock llama.cpp (patch 32). Slow. |
+| `GGML_CUDA_P60_MEGAX=1` | With `EXACT`: an exact persistent MoE kernel, somewhat faster than the stock kernels (patches 33-34). |
 
 Each piece also has its own `GGML_CUDA_P60_*=0` switch to turn it off for A/B testing (`_ATTN`, `_FA`, `_FA_PF`,
 `_Q8T`, `_MOE_GEMM`, `_GDN_CHUNK`, `_FUSE_*`, ...); `GGML_CUDA_P60_MEGA_DEBUG=1` logs why a layer did not match the
@@ -96,6 +136,13 @@ shared expert, GDN recurrence with the rollback snapshots llama.cpp keeps, atten
 all inside. Plus a multi-token output-layer matvec and a flash-attention kernel for the verify pass. The graph
 matchers check every node, weight name and tensor layout and fall back to the normal path on anything
 unexpected.
+
+**MTP invariance and the stock-exact mode (patches 32-35).** See [MTP output and a stock-exact mode](#mtp-output-and-a-stock-exact-mode-patches-32-35).
+`EXACT` tags generation graphs (every token outputs logits) so that only decode and verify steps change, runs the
+MoE matvec one token at a time, splits dense matvecs into chunks of 4 columns, and runs flash attention per token
+over the KV length single-token decode would use. `MEGAX` replaces the MoE half with a persistent kernel in which
+each warp reproduces a stock kernel's thread layout and summation order. `INVAR` routes single-token steps through
+the multi-token persistent kernels.
 
 **Prompt processing (patches 26-31).** An fp16 grouped GEMM for the MoE experts (q4_K / q5_K / q6_K dequantized to
 fp16 in shared memory, HFMA2 math, fp32 accumulation) instead of int8 MMQ, which sm_60 can only emulate: ~2.8x

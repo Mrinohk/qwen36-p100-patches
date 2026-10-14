@@ -1,0 +1,656 @@
+From 7c868752869e12db8eab51014c48e11f89f4413a Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:03:38 -0400
+Subject: [PATCH 34/35] p60 exact: MoE half v2 - shared weight rows across
+ tokens, lean exact dots
+
+Same results as v1 (bit-identical to stock decode, T=1..6), reworked:
+the kernel is templated on the token count, each weight row (and each
+distinct expert of all tokens) is computed once for every token that
+uses it, and the stock vec_dot float expressions are fed by cheaper but
+equal integer parts: per-token tables of the q8_1 scales and value sums
+(dot2), int -> float without I2F, exact float products instead of
+32-bit integer multiplies. GGML_CUDA_P60_MEGAX_TIME=1 prints per-phase
+times.
+
+Measured: T=1 ~113 us per MoE half (v1 120, stock kernels ~135),
+T=6 ~496 us (v1 518). The kernel is instruction bound on the emulated
+int8 dot (sm_60 has no dp4a) plus k-quant unpacking, not memory bound.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/p60-mega-x.cu | 528 +++++++++++++++++++++++++++----
+ 1 file changed, 471 insertions(+), 57 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/p60-mega-x.cu b/ggml/src/ggml-cuda/p60-mega-x.cu
+index 7919dad6b..026423aba 100644
+--- a/ggml/src/ggml-cuda/p60-mega-x.cu
++++ b/ggml/src/ggml-cuda/p60-mega-x.cu
+@@ -3,6 +3,7 @@
+ #include "unary.cuh"
+ 
+ #include <cstdio>
++#include <type_traits>
+ 
+ // Exact persistent kernels (GGML_CUDA_P60_MEGAX=1, generation steps tagged by GGML_CUDA_P60_EXACT): every token gives
+ // bit-identical results to the stock single-token kernels. Each warp emulates the thread layout and reduction order of
+@@ -14,6 +15,13 @@ namespace {
+ constexpr int NT = 512, NW = NT / 32;
+ constexpr int D = 2048, NE = 256, NU = 8, FF = 512, TMAX = 6;
+ 
++__device__ __forceinline__ unsigned long long gtimer() {
++    unsigned long long t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++#define P60X_TM(i) if (P.tm && blockIdx.x == 0 && threadIdx.x == 0) P.tm[i] = gtimer()
++
+ __device__ __forceinline__ void grid_sync(unsigned * bar, unsigned & target) {
+     __syncthreads();
+     if (threadIdx.x == 0) {
+@@ -66,6 +74,232 @@ __device__ __forceinline__ float mmvq_row(const void * row, const block_q8_1 * y
+     return warp_reduce_sum<WARP_SIZE>(tmp);
+ }
+ 
++// ---- lean exact vec_dot: same float expressions as vecdotq.cuh, but the integer parts are computed more cheaply (an
++// int is the same value however it is computed): int -> float without I2F (quarter rate on sm_60), the q8_1 scales and
++// the sums of the q8_1 values (dot2 of the k-quants) come from per-token tables, and the weight-side unpacking of a
++// row is done once for all tokens.
++
++// exact for |x| < 2^22
++__device__ __forceinline__ float i2f_exact(const int x) {
++    return __int_as_float(0x4B400000 + x) - 12582912.0f;
++}
++
++// per-token tables for a q8_1 vector of nb blocks: d (as float) and the sums of ints q and q + 4 of each block (dot2)
++struct ytab {
++    const block_q8_1 * y;
++    const float * d8;   // [nb]
++    const float * s2;   // [nb][4] (integers, exact)
++};
++
++__device__ __forceinline__ void make_ytab(const block_q8_1 * y, float * d8, float * s2, const int nb, const int i0, const int step) {
++    for (int b = i0; b < nb; b += step) {
++        d8[b] = __low2float(y[b].ds);
++        const int * q = (const int *) y[b].qs;
++#pragma unroll
++        for (int k = 0; k < 4; k++) {
++            s2[4*b + k] = i2f_exact(ggml_cuda_dp4a(0x01010101, q[k + 4], ggml_cuda_dp4a(0x01010101, q[k], 0)));
++        }
++    }
++}
++
++template <ggml_type type> struct lean;
++
++template <> struct lean<GGML_TYPE_Q8_0> {
++    static constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
++    struct W { int v[VDR_Q8_0_Q8_1_MMVQ]; float d; };
++    static __device__ __forceinline__ W load(const void * vbq, const int kbx, const int iqs) {
++        const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
++        W w;
++#pragma unroll
++        for (int i = 0; i < vdr; ++i) w.v[i] = get_int_b2(bq8_0->qs, iqs + i);
++        w.d = bq8_0->d;
++        return w;
++    }
++    // b = q8_1 block index of kbx
++    static __device__ __forceinline__ float dot(const W & w, const ytab & Y, const int b, const int iqs) {
++        const block_q8_1 * bq8_1 = Y.y + b;
++        int sumi = 0;
++#pragma unroll
++        for (int i = 0; i < vdr; ++i) sumi = ggml_cuda_dp4a(w.v[i], get_int_b4(bq8_1->qs, iqs + i), sumi);
++        const float d8_0 = w.d, d8_1 = Y.d8[b];
++        return d8_0*d8_1 * i2f_exact(sumi);
++    }
++};
++
++template <> struct lean<GGML_TYPE_Q4_K> {
++    static constexpr int qk = QK_K, qi = QI4_K, vdr = VDR_Q4_K_Q8_1_MMVQ;
++    struct W { int v[2]; float sc[2], m[2]; float2 dm; };
++    static __device__ __forceinline__ W load(const void * vbq, const int kbx, const int iqs) {
++        const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
++        const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
++        const int * q4 = (const int *)(bq4_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
++        W w;
++        w.v[0] = q4[0];
++        w.v[1] = q4[4];
++        const uint16_t * scales = (const uint16_t *)bq4_K->scales;
++        const int j  = bq8_offset/2;
++        const int jm = j & 1;
++        const uint32_t s0 = scales[jm + 0];
++        const uint32_t s2 = scales[jm + 2];
++        const uint32_t s4 = scales[jm + 4];
++        const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
++        uint16_t aux[2];
++        aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
++        aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
++        const uint8_t * sc = (const uint8_t *)aux;
++        w.sc[0] = i2f_exact(sc[0]); w.sc[1] = i2f_exact(sc[1]); w.m[0] = i2f_exact(sc[2]); w.m[1] = i2f_exact(sc[3]);
++        w.dm = __half22float2(bq4_K->dm);
++        return w;
++    }
++    static __device__ __forceinline__ float dot(const W & w, const ytab & Y, const int b0, const int iqs) {
++        const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
++        float sumf_d = 0.0f;
++        float sumf_m = 0.0f;
++#pragma unroll
++        for (int i = 0; i < QR4_K; ++i) {
++            const int b = b0 + bq8_offset + i;
++            const int * q8 = (const int *)Y.y[b].qs + ((iqs/2)%4);
++            const int v0i = (w.v[0] >> (4*i)) & 0x0F0F0F0F;
++            const int v1i = (w.v[1] >> (4*i)) & 0x0F0F0F0F;
++            const int dot1 = ggml_cuda_dp4a(v1i, q8[4], ggml_cuda_dp4a(v0i, q8[0], 0));
++            const float dot2 = Y.s2[4*b + (iqs/2)%4];
++            const float d8 = Y.d8[b];
++            const float p1 = i2f_exact(dot1) * w.sc[i];   // == (float) (dot1 * sc[i]), exact
++            const float p2 = dot2 * w.m[i];                // == (float) (dot2 * m[i]), exact
++            sumf_d += d8 * p1;
++            sumf_m += d8 * p2;
++        }
++        return w.dm.x*sumf_d - w.dm.y*sumf_m;
++    }
++};
++
++template <> struct lean<GGML_TYPE_Q5_K> {
++    static constexpr int qk = QK_K, qi = QI5_K, vdr = VDR_Q5_K_Q8_1_MMVQ;
++    struct W { int vl[2], vh[2]; float sc[2], m[2]; float2 dm; };
++    static __device__ __forceinline__ W load(const void * vbq, const int kbx, const int iqs) {
++        const block_q5_K * bq5_K = (const block_q5_K *) vbq + kbx;
++        const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
++        const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
++        const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
++        W w;
++        w.vl[0] = ql[0];
++        w.vl[1] = ql[4];
++        w.vh[0] = qh[0] >> bq8_offset;
++        w.vh[1] = qh[4] >> bq8_offset;
++        const uint16_t * scales = (const uint16_t *)bq5_K->scales;
++        const int j  = bq8_offset/2;
++        const int jm = j & 1;
++        const uint32_t s0 = scales[jm + 0];
++        const uint32_t s2 = scales[jm + 2];
++        const uint32_t s4 = scales[jm + 4];
++        const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
++        uint16_t aux[2];
++        aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
++        aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
++        const uint8_t * sc = (const uint8_t *)aux;
++        w.sc[0] = i2f_exact(sc[0]); w.sc[1] = i2f_exact(sc[1]); w.m[0] = i2f_exact(sc[2]); w.m[1] = i2f_exact(sc[3]);
++        w.dm = __half22float2(bq5_K->dm);
++        return w;
++    }
++    static __device__ __forceinline__ float dot(const W & w, const ytab & Y, const int b0, const int iqs) {
++        const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
++        float sumf_d = 0.0f;
++        float sumf_m = 0.0f;
++#pragma unroll
++        for (int i = 0; i < QR5_K; ++i) {
++            const int b = b0 + bq8_offset + i;
++            const int * q8 = (const int *)Y.y[b].qs + ((iqs/2)%4);
++            const int vl0i = (w.vl[0] >> (4*i)) & 0x0F0F0F0F;
++            const int vl1i = (w.vl[1] >> (4*i)) & 0x0F0F0F0F;
++            const int vh0i = ((w.vh[0] >> i) << 4) & 0x10101010;
++            const int vh1i = ((w.vh[1] >> i) << 4) & 0x10101010;
++            const int v0i = vl0i | vh0i;
++            const int v1i = vl1i | vh1i;
++            const int dot1 = ggml_cuda_dp4a(v0i, q8[0], ggml_cuda_dp4a(v1i, q8[4], 0));
++            const float dot2 = Y.s2[4*b + (iqs/2)%4];
++            const float d8 = Y.d8[b];
++            const float p1 = i2f_exact(dot1) * w.sc[i];   // == (float) (dot1 * sc[i]), exact
++            const float p2 = dot2 * w.m[i];                // == (float) (dot2 * m[i]), exact
++            sumf_d += d8 * p1;
++            sumf_m += d8 * p2;
++        }
++        return w.dm.x*sumf_d - w.dm.y*sumf_m;
++    }
++};
++
++template <> struct lean<GGML_TYPE_Q6_K> {
++    static constexpr int qk = QK_K, qi = QI6_K, vdr = VDR_Q6_K_Q8_1_MMVQ;
++    struct W { int vl, vh; float sc[2]; float d; };
++    static __device__ __forceinline__ W load(const void * vbq, const int kbx, const int iqs) {
++        const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++        const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++        const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++        W w;
++        w.vl = get_int_b2(bq6_K->ql, iqs);
++        w.vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
++        const int8_t * scales = bq6_K->scales + scale_offset;
++        w.sc[0] = i2f_exact(scales[0]); w.sc[1] = i2f_exact(scales[4]);
++        w.d = bq6_K->d;
++        return w;
++    }
++    static __device__ __forceinline__ float dot(const W & w, const ytab & Y, const int b0, const int iqs) {
++        const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++        float sumf = 0.0f;
++#pragma unroll
++        for (int i = 0; i < QR6_K; ++i) {
++            const int b = b0 + bq8_offset + 2*i;
++
++            const int vil = (w.vl >> (4*i)) & 0x0F0F0F0F;
++            const int vih = ((w.vh >> (4*i)) << 4) & 0x30303030;
++            const int vi = __vsubss4((vil | vih), 0x20202020);
++            const float d8 = Y.d8[b];
++            const float p = i2f_exact(ggml_cuda_dp4a(vi, get_int_b4(Y.y[b].qs, iqs % QI8_1), 0)) * w.sc[i];
++            sumf += d8 * p;
++        }
++        return w.d*sumf;
++    }
++};
++
++// mul_mat_vec_q rows (ncols_dst = 1, 4 warps) for up to TMAX tokens (bit t of mask): the weight unpacking is shared
++template <ggml_type type, int TT>
++__device__ __forceinline__ void mmvq_row_t(const void * row, const int ncols_x, const ytab * Y, const unsigned mask,
++        const int lane, float * out) {
++    using L = lean<type>;
++    constexpr int nwarps = 4;
++    const int blocks_per_row_x = ncols_x / L::qk;
++    constexpr int blocks_per_iter = L::vdr * nwarps*WARP_SIZE / L::qi;
++    float part[TT][nwarps];
++#pragma unroll
++    for (int t = 0; t < TT; t++)
++#pragma unroll
++        for (int w = 0; w < nwarps; w++) part[t][w] = 0.0f;
++#pragma unroll
++    for (int w = 0; w < nwarps; w++) {
++        const int tid = WARP_SIZE*w + lane;
++        for (int kbx = tid / (L::qi/L::vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++            const int kby = kbx * (L::qk/QK8_1);
++            const int kqs = L::vdr * (tid % (L::qi/L::vdr));
++            const typename L::W wd = L::load(row, kbx, kqs);
++#pragma unroll
++            for (int t = 0; t < TT; t++) {
++                if (mask & (1u << t)) part[t][w] += L::dot(wd, Y[t], kby, kqs);
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < TT; t++) {
++        if (mask & (1u << t)) {
++            float tmp = part[t][0];
++#pragma unroll
++            for (int l = 0; l < nwarps-1; ++l) {
++                tmp += part[t][l + 1];
++            }
++            tmp = warp_reduce_sum<WARP_SIZE>(tmp);
++            out[t] = tmp;
++        }
++    }
++}
++
+ // mul_mat_vec_f<float, float, ncols_dst = 1, block_size = 256>, K = 2048: one output row from one warp
+ __device__ __forceinline__ float mmvf_row(const float * x, const float * y, const int lane) {
+     constexpr int block_size = 256, ncols2 = D / 2;
+@@ -256,22 +490,109 @@ struct moe_x_params {
+     block_q8_1 * eact;   // [T][NU][FF/32] expert swiglu (q8_1)
+     float * shd;         // [T][D] shared expert down
+     float * dbg;         // [T][NU+2][D] debug: expert down per slot, moe sum, gated shared expert (or nullptr)
++    unsigned long long * tm; // debug: globaltimer of block 0 at phase ends (or nullptr)
+     unsigned * bar;
+     unsigned base;
+ };
+ 
+-template <ggml_type tg, ggml_type td>
++// Stream of weight rows through a per-warp smem stage: row m + 1 is loaded into registers while row m is computed from
++// smem by the stock vec_dot functions. LD is the load unit (int4 needs 16-byte aligned rows).
++template <typename LD, int NBYTES, typename SrcFn, typename CompFn>
++__device__ __forceinline__ void stream_rows(const int M, uint8_t * stage, const int lane, SrcFn src, CompFn comp) {
++    static_assert(NBYTES % sizeof(LD) == 0, "row size");
++    constexpr int NL = NBYTES / sizeof(LD), PER = (NL + WARP_SIZE - 1) / WARP_SIZE;
++    LD buf[PER];
++    auto ld = [&](int m) {
++        const LD * p = (const LD *) src(m);
++#pragma unroll
++        for (int i = 0; i < PER; i++) {
++            const int idx = i*WARP_SIZE + lane;
++            if (idx < NL) buf[i] = __ldg(p + idx);
++        }
++    };
++    if (M > 0) ld(0);
++    for (int m = 0; m < M; m++) {
++#pragma unroll
++        for (int i = 0; i < PER; i++) {
++            const int idx = i*WARP_SIZE + lane;
++            if (idx < NL) ((LD *) stage)[idx] = buf[i];
++        }
++        __syncwarp();
++        if (m + 1 < M) ld(m + 1);
++        comp(m, stage);
++        __syncwarp();
++    }
++}
++
++// mul_mat_vec_f rows (block_size 256, K = 2048) for T tokens: the weight row is read once
++template <int TT>
++__device__ __forceinline__ void mmvf_row_t(const float * x, const float * y, const int lane, float * out) {
++    constexpr int block_size = 256, ncols2 = D / 2, NWV = block_size / WARP_SIZE;
++    const float2 * x2 = (const float2 *) x;
++    const float2 * y2 = (const float2 *) y;
++    float sumf[TT][NWV];
++#pragma unroll
++    for (int t = 0; t < TT; t++)
++#pragma unroll
++        for (int w = 0; w < NWV; w++) sumf[t][w] = 0.0f;
++#pragma unroll
++    for (int w = 0; w < NWV; w++) {
++        const int tid = WARP_SIZE*w + lane;
++#pragma unroll
++        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++            const float2 tmpx = __ldg(x2 + col2);
++#pragma unroll
++            for (int t = 0; t < TT; t++) {
++                {
++                    const float2 tmpy = __ldcg(y2 + t*ncols2 + col2);
++                    ggml_cuda_mad(sumf[t][w], tmpx.x, tmpy.x);
++                    ggml_cuda_mad(sumf[t][w], tmpx.y, tmpy.y);
++                }
++            }
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < TT; t++) {
++        {
++            float v = 0.0f;
++#pragma unroll
++            for (int w = 0; w < NWV; w++) {
++                const float r = warp_reduce_sum<WARP_SIZE>(sumf[t][w]);
++                if (lane == w) v = r;
++            }
++            v = warp_reduce_sum<WARP_SIZE>(v);
++            if (lane == 0) out[t] = v;
++        }
++    }
++}
++
++constexpr int Q8C = 32*34;                  // a 1024-wide q8_0 chunk (half of a 2048 row)
++constexpr int YQ_BYTES  = TMAX*(D/QK8_1)*sizeof(block_q8_1);
++constexpr int YT_BYTES  = TMAX*(D/QK8_1)*(sizeof(float) + 4*sizeof(float));       // d8 + s2 tables of yq
++constexpr int ET_BYTES  = TMAX*NU*(FF/QK8_1)*(sizeof(float) + 4*sizeof(float));  // d8 + s2 tables of eact
++template <ggml_type tg> constexpr __host__ __device__ int ubuf_bytes() {
++    constexpr int u1 = YQ_BYTES + YT_BYTES;
++    constexpr int u4 = ET_BYTES + NW*TMAX*NU*(int) sizeof(float);
++    return u1 > u4 ? u1 : u4;
++}
++
++template <int TT, ggml_type tg, ggml_type td>
+ __global__ void __launch_bounds__(NT, 1) p60_mega_moe_x_kernel(const moe_x_params P) {
+     __shared__ float s_sum[2*NW];
+     __shared__ int   sel[TMAX][NU];
+     __shared__ float selw[TMAX][NU];
+     __shared__ float sig[TMAX];
+     __shared__ block_q8_1 shact[TMAX][FF/QK8_1];
++    __shared__ int   uid[TMAX*NU], umask[TMAX*NU], n_u;
++    __shared__ unsigned char uslot[TMAX*NU][TMAX];
++    __shared__ float shd8[TMAX][FF/QK8_1];
++    __shared__ __align__(16) uint8_t ubuf[ubuf_bytes<tg>()];
+     const ggml_cuda_p60_mega_moe_args & A = P.a;
+-    const int T = P.T;
++    constexpr int T = TT;
+     const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
+     const int gw = warp * gridDim.x + blockIdx.x, nwg = NW * gridDim.x;
+     unsigned target = P.base;
++    P60X_TM(0);
+ 
+     // phase 0: rms_norm * w per token (block t), then quantize_q8_1
+     if ((int) blockIdx.x < T) {
+@@ -281,31 +602,48 @@ __global__ void __launch_bounds__(NT, 1) p60_mega_moe_x_kernel(const moe_x_param
+             quantize_block(__ldcg(P.xn + t*D + b*QK8_1 + lane), P.yq + t*(D/QK8_1) + b, lane);
+         }
+     }
++    P60X_TM(1);
+     grid_sync(P.bar, target);
+ 
+-    // phase 1: router, shared expert gate logit (f32), shared gate / up (q8_0)
++    block_q8_1 * yq_s = (block_q8_1 *) ubuf;          // [T][D/32]
++    float * yq_d8 = (float *) (ubuf + YQ_BYTES);       // [T][D/32]
++    float * yq_s2 = yq_d8 + TMAX*(D/QK8_1); // [T][D/32][4]
++    for (int i = threadIdx.x; i < T*(D/QK8_1)*(int) sizeof(block_q8_1)/4; i += NT) {
++        ((int *) yq_s)[i] = __ldcg((const int *) P.yq + i);
++    }
++    __syncthreads();
++    make_ytab(yq_s, yq_d8, yq_s2, T*(D/QK8_1), threadIdx.x, NT);
++    __syncthreads();
++    ytab Yq[TT];
++#pragma unroll
++    for (int t = 0; t < TT; t++) Yq[t] = { yq_s + t*(D/QK8_1), yq_d8 + t*(D/QK8_1), yq_s2 + 4*t*(D/QK8_1) };
++    const unsigned all = (1u << T) - 1;
++
++    // phase 1: router + shared expert gate logit (f32 rows), shared gate / up (q8_0 rows in two chunks)
+     {
+-        const int n_r = T*NE, n_s = T, n_gu = T*2*FF;
+-        for (int u = gw; u < n_r + n_s + n_gu; u += nwg) {
+-            if (u < n_r) {
+-                const int t = u / NE, r = u % NE;
+-                const float v = mmvf_row(A.router + (size_t) r*D, P.xn + t*D, lane);
+-                if (lane == 0) P.logits[t*NE + r] = v;
+-            } else if (u < n_r + n_s) {
+-                const int t = u - n_r;
+-                const float v = mmvf_row(A.sgate, P.xn + t*D, lane);
+-                if (lane == 0) P.sgl[t] = v;
+-            } else {
+-                const int v0 = u - n_r - n_s, t = v0 / (2*FF), j = v0 % (2*FF);
+-                const char * w = (j < FF ? A.sg : A.su) + (size_t) (j % FF) * row_bytes<GGML_TYPE_Q8_0>(D);
+-                const float v = mmvq_row<GGML_TYPE_Q8_0>(w, P.yq + t*(D/QK8_1), D, lane);
+-                if (lane == 0) P.shgu[t*2*FF + j] = v;
++        constexpr int NR = NE + 1;
++        for (int k = gw; k < NR; k += nwg) {
++            float out[TT];
++            mmvf_row_t<TT>(k < NE ? A.router + (size_t) k*D : A.sgate, P.xn, lane, out);
++            if (lane == 0) {
++                for (int t = 0; t < T; t++) {
++                    if (k < NE) P.logits[t*NE + k] = out[t]; else P.sgl[t] = out[t];
++                }
++            }
++        }
++        for (int j = gw >= NR ? gw - NR : gw + ((NR - gw + nwg - 1) / nwg) * nwg - NR; j < 2*FF; j += nwg) {
++            float out[TT];
++            mmvq_row_t<GGML_TYPE_Q8_0, TT>((j < FF ? A.sg : A.su) + (size_t) (j % FF) * row_bytes<GGML_TYPE_Q8_0>(D), D, Yq, all, lane, out);
++            if (lane == 0) {
++                for (int t = 0; t < T; t++) P.shgu[t*2*FF + j] = out[t];
+             }
+         }
+     }
++    P60X_TM(2);
+     grid_sync(P.bar, target);
+ 
+-    // per block: top-8 + weights per token, shared expert gate sigmoid, shared swiglu quantized to q8_1
++    // per block: top-8 + weights per token, shared expert gate sigmoid, shared swiglu quantized to q8_1, the distinct
++    // experts of all tokens (uid) with the tokens that use them (umask) and in which slot (uslot)
+     if (warp < T) {
+         topk_moe_warp(P.logits + warp*NE, sel[warp], selw[warp], A.clamp, lane);
+     }
+@@ -319,23 +657,50 @@ __global__ void __launch_bounds__(NT, 1) p60_mega_moe_x_kernel(const moe_x_param
+         quantize_block(silu_x(g) * up, &shact[t][b], lane);
+     }
+     __syncthreads();
++    for (int b = threadIdx.x; b < T*(FF/QK8_1); b += NT) {
++        shd8[b / (FF/QK8_1)][b % (FF/QK8_1)] = __low2float(shact[b / (FF/QK8_1)][b % (FF/QK8_1)].ds);
++    }
++    if (threadIdx.x == 0) {
++        int n = 0;
++        for (int t = 0; t < T; t++) {
++            for (int e = 0; e < NU; e++) {
++                int u = 0;
++                while (u < n && uid[u] != sel[t][e]) u++;
++                if (u == n) { uid[n] = sel[t][e]; umask[n] = 0; n++; }
++                umask[u] |= 1 << t;
++                uslot[u][t] = (unsigned char) e;
++            }
++        }
++        n_u = n;
++    }
++    __syncthreads();
+ 
+-    // phase 2: expert gate / up, shared down (q8_0, K = 512)
++    // phase 2: expert gate / up rows (each distinct expert row once, for every token that uses it), shared down (q8_0, K = 512)
+     {
+-        const int n_e = T*NU*2*FF, n_d = T*D;
+-        for (int u = gw; u < n_e + n_d; u += nwg) {
+-            if (u < n_e) {
+-                const int t = u / (NU*2*FF), e = (u / (2*FF)) % NU, j = u % (2*FF);
+-                const char * w = (j < FF ? A.gate : A.up) + ((size_t) sel[t][e]*FF + j % FF) * row_bytes<tg>(D);
+-                const float v = mmvq_row<tg>(w, P.yq + t*(D/QK8_1), D, lane);
+-                if (lane == 0) P.egu[u] = v;
+-            } else {
+-                const int t = (u - n_e) / D, r = (u - n_e) % D;
+-                const float v = mmvq_row<GGML_TYPE_Q8_0>(A.sd + (size_t) r * row_bytes<GGML_TYPE_Q8_0>(FF), shact[t], FF, lane);
+-                if (lane == 0) P.shd[t*D + r] = v;
++        const int nu = n_u, ne_jobs = nu*2*FF;
++        for (int k = gw; k < ne_jobs; k += nwg) {
++            const int u = k / (2*FF), j = k % (2*FF);
++            const unsigned mask = umask[u];
++            float out[TT];
++            mmvq_row_t<tg, TT>((j < FF ? A.gate : A.up) + ((size_t) uid[u]*FF + j % FF) * row_bytes<tg>(D), D, Yq, mask, lane, out);
++            if (lane == 0) {
++                for (int t = 0; t < T; t++) {
++                    if (mask & (1u << t)) P.egu[(t*NU + uslot[u][t])*2*FF + j] = out[t];
++                }
++            }
++        }
++        ytab Ys[TT];
++#pragma unroll
++        for (int t = 0; t < TT; t++) Ys[t] = { shact[t], shd8[t], nullptr };
++        for (int r = gw >= ne_jobs ? gw - ne_jobs : gw + ((ne_jobs - gw + nwg - 1) / nwg) * nwg - ne_jobs; r < D; r += nwg) {
++            float out[TT];
++            mmvq_row_t<GGML_TYPE_Q8_0, TT>(A.sd + (size_t) r * row_bytes<GGML_TYPE_Q8_0>(FF), FF, Ys, all, lane, out);
++            if (lane == 0) {
++                for (int t = 0; t < T; t++) P.shd[t*D + r] = out[t];
+             }
+         }
+     }
++    P60X_TM(3);
+     grid_sync(P.bar, target);
+ 
+     // phase 3: expert swiglu, quantized to q8_1
+@@ -344,33 +709,61 @@ __global__ void __launch_bounds__(NT, 1) p60_mega_moe_x_kernel(const moe_x_param
+         const float g = __ldcg(P.egu + te*2*FF + i), up = __ldcg(P.egu + te*2*FF + FF + i);
+         quantize_block(silu_x(g) * up, P.eact + te*(FF/QK8_1) + b, lane);
+     }
++    P60X_TM(4);
+     grid_sync(P.bar, target);
+ 
+-    // phase 4: expert down rows, weighted sum (moe_weighted_reduction_f32), shared expert gate, residual adds
+-    for (int u = gw; u < T*D; u += nwg) {
+-        const int t = u / D, r = u % D;
+-        float sum = 0.0f;
+-#pragma unroll 1
+-        for (int e = 0; e < NU; e++) {
+-            const char * w = A.down + ((size_t) sel[t][e]*D + r) * row_bytes<td>(FF);
+-            const float v = mmvq_row<td>(w, P.eact + (t*NU + e)*(FF/QK8_1), FF, lane);
+-            const float scale = 1.0f;
+-            if (P.dbg && lane == 0) P.dbg[(t*(NU+2) + e)*D + r] = v;
+-            if (e == 0) {
+-                sum = (v * scale) * selw[t][0];
+-            } else {
+-                sum += (v * scale) * selw[t][e];
++    // phase 4: expert down rows (each distinct expert row once), weighted sum (moe_weighted_reduction_f32), shared
++    // expert gate, residual adds
++    {
++        float * ea_d8 = (float *) ubuf;                          // [T][NU][FF/32]
++        float * ea_s2 = ea_d8 + TMAX*NU*(FF/QK8_1);   // [T][NU][FF/32][4]
++        float * res = (float *) (ubuf + ET_BYTES) + warp*TMAX*NU;
++        __syncthreads();
++        make_ytab(P.eact, ea_d8, ea_s2, T*NU*(FF/QK8_1), threadIdx.x, NT);
++        __syncthreads();
++        const int nu = n_u;
++        for (int r = gw; r < D; r += nwg) {
++            for (int u = 0; u < nu; u++) {
++                const unsigned mask = umask[u];
++                ytab Ye[TT];
++#pragma unroll
++                for (int t = 0; t < TT; t++) {
++                    const int te = (t*NU + ((mask >> t) & 1 ? uslot[u][t] : 0))*(FF/QK8_1);
++                    Ye[t] = { P.eact + te, ea_d8 + te, ea_s2 + 4*te };
++                }
++                float out[TT];
++                mmvq_row_t<td, TT>(A.down + ((size_t) uid[u]*D + r) * row_bytes<td>(FF), FF, Ye, mask, lane, out);
++                if (lane == 0) {
++                    for (int t = 0; t < T; t++) {
++                        if (mask & (1u << t)) res[t*NU + uslot[u][t]] = out[t];
++                    }
++                }
+             }
+-        }
+-        if (lane == 0) {
+-            const float shg = __ldcg(P.shd + t*D + r) * sig[t];
+-            if (P.dbg) { P.dbg[(t*(NU+2) + NU)*D + r] = sum; P.dbg[(t*(NU+2) + NU + 1)*D + r] = shg; }
+-            float result = sum;
+-            result = result + shg;
+-            result = result + A.x_in[t*D + r];
+-            A.x_out[t*D + r] = result;
++            __syncwarp();
++            if (lane < T) {
++                const int t = lane;
++                float sum = 0.0f;
++                for (int e = 0; e < NU; e++) {
++                    const float v = res[t*NU + e];
++                    const float scale = 1.0f;
++                    if (P.dbg) P.dbg[(t*(NU+2) + e)*D + r] = v;
++                    if (e == 0) {
++                        sum = (v * scale) * selw[t][0];
++                    } else {
++                        sum += (v * scale) * selw[t][e];
++                    }
++                }
++                const float shg = __ldcg(P.shd + t*D + r) * sig[t];
++                if (P.dbg) { P.dbg[(t*(NU+2) + NU)*D + r] = sum; P.dbg[(t*(NU+2) + NU + 1)*D + r] = shg; }
++                float result = sum;
++                result = result + shg;
++                result = result + A.x_in[t*D + r];
++                A.x_out[t*D + r] = result;
++            }
++            __syncwarp();
+         }
+     }
++    P60X_TM(5);
+ }
+ 
+ } // namespace
+@@ -397,6 +790,10 @@ void ggml_cuda_p60_mega_moe_x(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+     const bool dump = args.il == dump_il || dump_il == 99;
+     ggml_cuda_pool_alloc<float> dbg(ctx.pool(), dump ? (size_t) T*(NU+2)*D : 1);
+     kp.dbg = dump ? dbg.get() : nullptr;
++    static const bool timing = getenv("GGML_CUDA_P60_MEGAX_TIME") != nullptr;
++    static unsigned long long * tm_d = nullptr;
++    if (timing && tm_d == nullptr) CUDA_CHECK(cudaMalloc(&tm_d, 16*sizeof(unsigned long long)));
++    kp.tm = timing ? tm_d : nullptr;
+     if (ctx.p60_mega_bar == nullptr) {
+         CUDA_CHECK(cudaMalloc(&ctx.p60_mega_bar, sizeof(unsigned)));
+         CUDA_CHECK(cudaMemset(ctx.p60_mega_bar, 0, sizeof(unsigned)));
+@@ -408,12 +805,29 @@ void ggml_cuda_p60_mega_moe_x(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+     void * kargs[] = { &kp };
+     void (*kernel)(const moe_x_params) = nullptr;
+     const bool g5 = args.gate_type == GGML_TYPE_Q5_K, d6 = args.down_type == GGML_TYPE_Q6_K;
+-    if      (!g5 && !d6) kernel = p60_mega_moe_x_kernel<GGML_TYPE_Q4_K, GGML_TYPE_Q5_K>;
+-    else if (!g5 &&  d6) kernel = p60_mega_moe_x_kernel<GGML_TYPE_Q4_K, GGML_TYPE_Q6_K>;
+-    else if ( g5 &&  d6) kernel = p60_mega_moe_x_kernel<GGML_TYPE_Q5_K, GGML_TYPE_Q6_K>;
+-    else                 kernel = p60_mega_moe_x_kernel<GGML_TYPE_Q5_K, GGML_TYPE_Q5_K>;
++#define P60X_K(TT) \
++    if      (!g5 && !d6) kernel = p60_mega_moe_x_kernel<TT, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K>; \
++    else if (!g5 &&  d6) kernel = p60_mega_moe_x_kernel<TT, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K>; \
++    else if ( g5 &&  d6) kernel = p60_mega_moe_x_kernel<TT, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K>; \
++    else                 kernel = p60_mega_moe_x_kernel<TT, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K>;
++    switch (T) {
++        case 1: P60X_K(1) break;
++        case 2: P60X_K(2) break;
++        case 3: P60X_K(3) break;
++        case 4: P60X_K(4) break;
++        case 5: P60X_K(5) break;
++        default: P60X_K(6) break;
++    }
++#undef P60X_K
+     CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) kernel, dim3(nblk), dim3(NT), kargs, 0, ctx.stream()));
+     ctx.p60_mega_epoch += (unsigned) (4 * nblk);
++    if (timing) {
++        unsigned long long h[6];
++        CUDA_CHECK(cudaMemcpyAsync(h, tm_d, sizeof(h), cudaMemcpyDeviceToHost, ctx.stream()));
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        fprintf(stderr, "megax-moe T=%d il=%d phases us: %.1f %.1f %.1f %.1f %.1f total %.1f\n", T, args.il,
++            (h[1]-h[0])/1e3, (h[2]-h[1])/1e3, (h[3]-h[2])/1e3, (h[4]-h[3])/1e3, (h[5]-h[4])/1e3, (h[5]-h[0])/1e3);
++    }
+     // GGML_CUDA_P60_MEGAX_DUMP=layer: write token 0's intermediates of that layer as float arrays (debug)
+     if (dump) {
+         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+-- 
+2.56.0
+

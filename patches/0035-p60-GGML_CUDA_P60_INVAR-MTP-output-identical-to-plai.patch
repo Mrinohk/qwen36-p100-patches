@@ -1,0 +1,165 @@
+From d311a8d04ecdeec27c06ddeff3575ec62176cf67 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 18:44:46 -0400
+Subject: [PATCH 35/35] p60: GGML_CUDA_P60_INVAR - MTP output identical to
+ plain decode
+
+With the fast persistent kernels (GGML_CUDA_P60_MMVQ=1, MEGA=1) the
+multi-token verify kernels (p60-mega-t.cu, p60-fa.cu, q8_0_t) already
+give bit-identical per-token results for T = 2..6, but single-token
+decode used the fp32 single-token kernels (p60-mega.cu, mmvq-p60), so a
+token's logits depended on whether it was verified in a batch or
+decoded alone. GGML_CUDA_P60_INVAR=1 runs single-token steps through
+the multi-token kernels with T = 1 (MoE half, gated delta net half,
+q8_0 output layer; the attention half already used one kernel family).
+
+Measured (greedy, 3 real harness prompts): logits of T=1..6 bit-
+identical over 160 rows incl. a 256-position KV boundary; llama-server
+with MTP gives token-identical output to the same build without MTP.
+Speed with MTP 153/250/200 -> 149/225/197 t/s, without MTP ~ -1%.
+Also adds debug dumps (GGML_CUDA_P60_MEGAT_DUMP) to the gdn / moe
+multi-token launchers.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/common.cuh    |  7 +++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  6 +++---
+ ggml/src/ggml-cuda/p60-mega-t.cu | 32 ++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/p60-mega.cuh  |  1 +
+ 4 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1adfeaf4f..5114d705e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -305,6 +305,13 @@ static const char * cu_get_error_str(CUresult err) {
+ #define FLASH_ATTN_AVAILABLE
+ #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
+ 
++// GGML_CUDA_P60_INVAR=1: single-token decode runs the multi-token (MTP verify) persistent kernels with T = 1, so a token
++// gets bit-identical results whether it is decoded alone or verified in a batch of up to 6
++static inline bool ggml_cuda_p60_invar() {
++    static const bool on = getenv("GGML_CUDA_P60_INVAR") != nullptr && atoi(getenv("GGML_CUDA_P60_INVAR")) != 0;
++    return on;
++}
++
+ // op_params[15] of MUL_MAT / MUL_MAT_ID set by llama under GGML_CUDA_P60_EXACT for generation steps (decode, MTP verify)
+ #define GGML_CUDA_P60_EXACT_TAG 0x50363045
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7133b3d50..fbb7dd65b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3991,7 +3991,7 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+         return e - i;
+     }
+     memcpy(&a.eps_norm, norm->op_params, sizeof(float));
+-    a.x_in = (const float *) norm->src[0]->data;  a.x_out = (float *) add->data;
++    a.x_in = (const float *) norm->src[0]->data;  a.x_out = (float *) add->data; a.il = il;
+     a.attn_norm = (const float *) nmul->src[1]->data;
+     a.qkv = (const char *) qkv->data; a.z = (const char *) z->data; a.out = (const char *) out->data;
+     a.alpha = (const float *) alpha->data; a.beta = (const float *) beta->data;
+@@ -4005,7 +4005,7 @@ static int p60_try_mega_gdn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     for (int k = 0; k < n_prerun; k++) {
+         ggml_cuda_compute_forward(*ctx, prerun[k]);
+     }
+-    if (cs_cpy && T == 1) {
++    if (cs_cpy && T == 1 && !ggml_cuda_p60_invar()) {
+         ggml_cuda_p60_mega_gdn(*ctx, a);
+     } else {
+         ggml_cuda_p60_mega_gdn_t(*ctx, a, (int) T, (int) K, cs_slot, ss_slot);
+@@ -4144,7 +4144,7 @@ static int p60_try_mega_moe(ggml_backend_cuda_context * ctx, ggml_cgraph * g, in
+     if (exact) {
+         a.router = (const float *) router->data; a.sgate = (const float *) sgate->data;
+         ggml_cuda_p60_mega_moe_x(*ctx, a, (int) T);
+-    } else if (T == 1 && gate->type == GGML_TYPE_Q4_K && down->type == GGML_TYPE_Q5_K) {
++    } else if (T == 1 && gate->type == GGML_TYPE_Q4_K && down->type == GGML_TYPE_Q5_K && !ggml_cuda_p60_invar()) {
+         ggml_cuda_p60_mega_moe(*ctx, a);
+     } else {
+         ggml_cuda_p60_mega_moe_t(*ctx, a, (int) T);
+diff --git a/ggml/src/ggml-cuda/p60-mega-t.cu b/ggml/src/ggml-cuda/p60-mega-t.cu
+index 5e67adc7d..cc8304eed 100644
+--- a/ggml/src/ggml-cuda/p60-mega-t.cu
++++ b/ggml/src/ggml-cuda/p60-mega-t.cu
+@@ -1,6 +1,8 @@
+ #include "p60-mega.cuh"
+ #include "p60-mt.cuh"
+ 
++#include <cstdio>
++
+ // Persistent multi-token (T = 2..6, MTP verify) kernels for the Qwen3.5/3.6 MoE layer halves on sm_60, plus the gated
+ // delta net half with recurrent-state snapshots (n_rs_seq > 0, also at T = 1). See p60-mega.cuh.
+ // Activations are fp16 in shared memory, groups of 4 stored as [x0, x2, x1, x3] so that a 32-bit weight word turns
+@@ -862,6 +864,15 @@ void ggml_cuda_p60_mega_moe_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+     const bool gu5 = args.gate_type == GGML_TYPE_Q5_K, dn6 = args.down_type == GGML_TYPE_Q6_K;
+     GGML_ASSERT((args.gate_type == GGML_TYPE_Q4_K || gu5) && (args.down_type == GGML_TYPE_Q5_K || dn6) && (!gu5 || dn6));
+     mega_launch(ctx, kern[gu5 ? 2 : dn6 ? 1 : 0][n_tokens - 1], kp, 3);
++    // GGML_CUDA_P60_MEGAT_DUMP=layer (99 = all): token 0's l_out of that layer (debug), file per token count
++    static const int dump_il = getenv("GGML_CUDA_P60_MEGAT_DUMP") ? atoi(getenv("GGML_CUDA_P60_MEGAT_DUMP")) : -1;
++    if (args.il == dump_il || dump_il == 99) {
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        std::vector<float> h(D);
++        CUDA_CHECK(cudaMemcpy(h.data(), args.x_out, D*sizeof(float), cudaMemcpyDeviceToHost));
++        char fn[64]; snprintf(fn, sizeof(fn), "megat_moe_%d_T%d.bin", args.il, n_tokens);
++        FILE * f = fopen(fn, "wb"); fwrite(h.data(), sizeof(float), D, f); fclose(f);
++    }
+ }
+ 
+ void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p60_mega_gdn_args & args, int n_tokens, int n_snap,
+@@ -892,6 +903,23 @@ void ggml_cuda_p60_mega_gdn_t(ggml_backend_cuda_context & ctx, const ggml_cuda_p
+     static const void * const kern[TM] = { (const void *) gdn_t_kernel<1>, (const void *) gdn_t_kernel<2>, (const void *) gdn_t_kernel<3>,
+                                            (const void *) gdn_t_kernel<4>, (const void *) gdn_t_kernel<5>, (const void *) gdn_t_kernel<6> };
+     mega_launch(ctx, kern[n_tokens - 1], kp, 3);
++    // GGML_CUDA_P60_MEGAT_DUMP=layer: token 0's intermediates of that layer (debug), file per token count
++    static const int dump_il = getenv("GGML_CUDA_P60_MEGAT_DUMP") ? atoi(getenv("GGML_CUDA_P60_MEGAT_DUMP")) : -1;
++    if (args.il == dump_il) {
++        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
++        char fn[64]; snprintf(fn, sizeof(fn), "megat_gdn_%d_T%d.bin", args.il, n_tokens);
++        FILE * f = fopen(fn, "wb");
++        std::vector<float> h;
++        auto put = [&](const char * name, const float * src, int n) {
++            h.resize(n);
++            CUDA_CHECK(cudaMemcpy(h.data(), src, n*sizeof(float), cudaMemcpyDeviceToHost));
++            fprintf(f, "%s\t%d\n", name, n);
++            fwrite(h.data(), sizeof(float), n, f);
++        };
++        put("qkvc", kp.qkvc, QKV); put("zv", kp.zv, VD); put("gb", kp.gb, 2 * HV); put("o", kp.o, VD);
++        put("y0", kp.y, D); put("y1", kp.y + (size_t) TM * D, D); put("x_out", args.x_out, D);
++        fclose(f);
++    }
+ }
+ 
+ bool ggml_cuda_p60_mul_mat_q8_0_t(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -900,7 +928,7 @@ bool ggml_cuda_p60_mul_mat_q8_0_t(ggml_backend_cuda_context & ctx, const ggml_te
+         (getenv("GGML_CUDA_P60_Q8T") == nullptr || atoi(getenv("GGML_CUDA_P60_Q8T")) != 0);
+     const int64_t T = src1->ne[1];
+     if (!enabled || src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+-            src0->ne[0] != K || T < 2 || T > TM || dst->ne[1] != T || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src0->ne[0] != K || T < (ggml_cuda_p60_invar() ? 1 : 2) || T > TM || dst->ne[1] != T || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+             src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0 ||
+             ((uintptr_t) src1->data) % 16 != 0 || src0->nb[1] % 16 != 0 || ((uintptr_t) src0->data) % 16 != 0 ||
+             dst->nb[0] != sizeof(float) || src0->ne[1] > INT_MAX) {
+@@ -908,7 +936,7 @@ bool ggml_cuda_p60_mul_mat_q8_0_t(ggml_backend_cuda_context & ctx, const ggml_te
+     }
+     const int nblk = ggml_cuda_info().devices[ctx.device].nsm;
+     static void (* const kern[TM])(const uint8_t *, int64_t, int, const float *, int64_t, float *, int64_t) = {
+-        nullptr, q8_0_t_kernel<2>, q8_0_t_kernel<3>, q8_0_t_kernel<4>, q8_0_t_kernel<5>, q8_0_t_kernel<6> };
++        q8_0_t_kernel<1>, q8_0_t_kernel<2>, q8_0_t_kernel<3>, q8_0_t_kernel<4>, q8_0_t_kernel<5>, q8_0_t_kernel<6> };
+     kern[T - 1]<<<nblk, mt::NT, 0, ctx.stream()>>>((const uint8_t *) src0->data, src0->nb[1], (int) src0->ne[1],
+         (const float *) src1->data, src1->nb[1] / sizeof(float), (float *) dst->data, dst->nb[1] / sizeof(float));
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+index cac11ea12..b8a9cf18e 100644
+--- a/ggml/src/ggml-cuda/p60-mega.cuh
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -33,6 +33,7 @@ struct ggml_cuda_p60_mega_gdn_args {
+     const int32_t * ss_ids;
+     int64_t       ss_row;
+     float *       ss_out;    // updated recurrent state
++    int           il;        // layer index (debug dumps)
+ };
+ 
+ // MoE half: post-attention norm -> router top-8 + shared expert gate -> expert gate/up + shared down -> expert down,
+-- 
+2.56.0
+

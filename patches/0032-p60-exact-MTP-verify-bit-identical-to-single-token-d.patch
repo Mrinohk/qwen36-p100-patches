@@ -1,0 +1,203 @@
+From 77d67a35bb6e5e5db266cfc4351e1036ec328936 Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:16:25 -0400
+Subject: [PATCH 32/35] p60 exact: MTP verify bit-identical to single-token
+ decode (stock kernels)
+
+GGML_CUDA_P60_EXACT=1 makes every generation step (all tokens output
+logits: decode or MTP verify, <= 8 tokens) compute each token exactly
+as single-token decode does:
+
+- llama tags the MUL_MAT / MUL_MAT_ID nodes of such graphs
+  (op_params[15]) and does not reuse the graph, the CUDA backend sets
+  ctx.p60_exact from the tag.
+- MUL_MAT_ID runs one token at a time: the multi-token MoE kernel uses
+  one warp per token and sums K in another order for some types.
+- dense MMVQ splits > 4 columns into chunks of 4: the generic table
+  uses 4 warps for 1-4 columns but 2 warps for 5-8.
+- flash attention runs one token at a time, each over the KV length
+  decode uses at that position (pad(pos + 1, 256)): the tile kernel
+  config and the KV split depend on the batch width and KV length.
+
+Prompt batches (only the last token outputs) are untouched, so prompt
+processing stays identical to stock.
+
+Measured (greedy, Qwen3.6-35B-A3B UD-Q4_K_XL, 2x P100, 3 real harness
+prompts): T=2..6 logits bit-identical to T=1 over 160 rows incl. a
+256-position KV boundary; T=1 bit-identical to stock; llama-server
+with MTP (n_max 5) + EXACT gives token-identical output to stock
+without speculation on all 3 prompts. Stock MTP diverges at token 11.
+MMVQ / MEGA paths are not covered yet.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/common.cuh   |  5 +++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  9 ++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 21 ++++++++++++++++++
+ src/llama-context.cpp           | 17 +++++++++++++-
+ src/llama-graph.cpp             | 39 ++++++++++++++++++++++++++-------
+ 5 files changed, 82 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 203ae2913..1adfeaf4f 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -305,6 +305,9 @@ static const char * cu_get_error_str(CUresult err) {
+ #define FLASH_ATTN_AVAILABLE
+ #endif // !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
+ 
++// op_params[15] of MUL_MAT / MUL_MAT_ID set by llama under GGML_CUDA_P60_EXACT for generation steps (decode, MTP verify)
++#define GGML_CUDA_P60_EXACT_TAG 0x50363045
++
+ static bool fp16_available(const int cc) {
+     return ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL ||
+         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_PH1);
+@@ -1465,6 +1468,8 @@ struct ggml_cuda_stream_context {
+ };
+ 
+ struct ggml_backend_cuda_context {
++    bool p60_exact = false; // current graph is a tagged generation step: keep each token bit-identical to decode
++
+     int device;
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 96ccbda83..934e31cea 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5500,6 +5500,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    cuda_ctx->p60_exact = false;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->op_params[15] == GGML_CUDA_P60_EXACT_TAG) {
++            cuda_ctx->p60_exact = true;
++            break;
++        }
++    }
++
+     // The q8_1 activation cache keys on a tensor pointer, which a later graph may
+     // reuse for a different tensor, so it must not outlive the graph that filled it
+     cuda_ctx->q8_1_cache_clear();
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6c030a81f..e69bf89ae 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1735,6 +1735,27 @@ void ggml_cuda_mul_mat_vec_q(
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+ 
++    // GGML_CUDA_P60_EXACT: run a multi-token MUL_MAT_ID one token at a time, so each token is bit-identical to decode.
++    // The multi-token MoE kernel uses one warp per token and sums K in another order for some types.
++    if (ids && dst->ne[2] > 1 && ctx.p60_exact) {
++        for (int64_t t = 0; t < dst->ne[2]; t++) {
++            ggml_tensor s1 = *src1; s1.ne[2] = 1; s1.data = (char *) src1->data + t*src1->nb[2];
++            ggml_tensor id = *ids;  id.ne[1] = 1; id.data = (char *) ids->data  + t*ids->nb[1];
++            ggml_tensor d  = *dst;  d.ne[2]  = 1; d.data  = (char *) dst->data  + t*dst->nb[2];
++            ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, &id, &d, fusion);
++        }
++        return;
++    }
++    // Same for dense: the generic table uses 4 warps for 1-4 columns but 2 warps for 5-8, so split into chunks of 4.
++    if (!ids && dst->ne[1] > 4 && dst->ne[2] == 1 && dst->ne[3] == 1 && ctx.p60_exact) {
++        for (int64_t c0 = 0; c0 < dst->ne[1]; c0 += 4) {
++            ggml_tensor s1 = *src1; s1.ne[1] = std::min<int64_t>(4, dst->ne[1] - c0); s1.data = (char *) src1->data + c0*src1->nb[1];
++            ggml_tensor d  = *dst;  d.ne[1]  = s1.ne[1];                              d.data  = (char *) dst->data  + c0*dst->nb[1];
++            ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, nullptr, &d, fusion);
++        }
++        return;
++    }
++
+     if (ggml_cuda_mmvq_p60(ctx, src0, src1, ids, dst, fusion)) {
+         return;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4ac478ec0..89cf5235e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1354,7 +1354,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    // GGML_CUDA_P60_EXACT: a generation step (every token outputs logits: decode or MTP verify) must give bit-identical
++    // results to single-token decode. Its graph depends on the token positions (see build_attn_mha), so do not reuse it.
++    static const bool p60_exact = getenv("GGML_CUDA_P60_EXACT") != nullptr && atoi(getenv("GGML_CUDA_P60_EXACT")) != 0;
++    const bool exact_gen = p60_exact && ubatch.n_tokens <= 8 && gparams.n_outputs == ubatch.n_tokens;
++
++    if (!graph_reuse_disable && !exact_gen && gf_res_prev_active == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1384,6 +1389,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // tell the CUDA backend: op_params[15] of the matmuls carries the exact-mode tag (0x50363045, "P60E")
++        if (exact_gen) {
++            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
++                ggml_tensor * node = ggml_graph_node(gf, i);
++                if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
++                    ((int32_t *) node->op_params)[15] = 0x50363045;
++                }
++            }
++        }
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fd4290cf0..0952893dc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2629,14 +2629,37 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+         }
+ 
+-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+-
+-        ggml_flash_attn_ext_add_sinks(cur, sinks);
+-        GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+-        ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+-        ggml_prec_set_acc(cur, GGML_PREC_F32);
++        // GGML_CUDA_P60_EXACT: generation steps (decode, MTP verify) run attention one token at a time, each over the KV length that
++        // single-token decode uses at that position (pad(pos + 1, 256)), so the kernel sees the same shapes as decode.
++        static const bool exact = getenv("GGML_CUDA_P60_EXACT") != nullptr && atoi(getenv("GGML_CUDA_P60_EXACT")) != 0;
++        const int64_t n_tok = q->ne[1];
++        if (exact && n_tok <= 8 && (int64_t) n_outputs == n_tok && n_stream == 1 && !v_trans && !v_mla && sinks == nullptr && kq_mask != nullptr &&
++                ubatch.pos != nullptr && ubatch.n_tokens == (uint32_t) n_tok && k->ne[1] % 256 == 0) {
++            cur = nullptr;
++            for (int64_t t = 0; t < n_tok; t++) {
++                const int64_t n_kv_t = std::min<int64_t>(k->ne[1], std::max<int64_t>(256, GGML_PAD((int64_t) ubatch.pos[t] + 1, 256)));
++                ggml_tensor * q_t = ggml_view_4d(ctx0, q, q->ne[0], 1, q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], t*q->nb[1]);
++                ggml_tensor * k_t = ggml_view_4d(ctx0, k, k->ne[0], n_kv_t, k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
++                ggml_tensor * v_t = ggml_view_4d(ctx0, v, v->ne[0], n_kv_t, v->ne[2], v->ne[3], v->nb[1], v->nb[2], v->nb[3], 0);
++                ggml_tensor * m_t = ggml_view_4d(ctx0, kq_mask, n_kv_t, 1, kq_mask->ne[2], kq_mask->ne[3],
++                                                 kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], t*kq_mask->nb[1]);
++                ggml_tensor * o_t = ggml_flash_attn_ext(ctx0, q_t, k_t, v_t, m_t, kq_scale, hparams.f_max_alibi_bias,
++                                                        hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, o_t, il});
++                ggml_flash_attn_ext_set_n_kv_max(o_t, static_cast<int32_t>(std::min<int64_t>(n_kv_max, n_kv_t)));
++                ggml_prec_set_acc(o_t, GGML_PREC_F32);
++                cur = cur ? ggml_concat(ctx0, cur, o_t, 2) : o_t;
++            }
++        } else {
++            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
++                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
++
++            ggml_flash_attn_ext_add_sinks(cur, sinks);
++            GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
++            ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
++            ggml_prec_set_acc(cur, GGML_PREC_F32);
++        }
+ 
+         if (v_mla) {
+ #if 0
+-- 
+2.56.0
+

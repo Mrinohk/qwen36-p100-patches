@@ -1,0 +1,72 @@
+From 08a89ece0cfffb574917e65081354b824f9af73e Mon Sep 17 00:00:00 2001
+From: Mrinohk <5554998+Mrinohk@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 14:45:58 -0400
+Subject: [PATCH 37/37] p60 mega attn: read the sequence's own KV stream
+
+With --parallel N and a per-sequence cache (--no-kv-unified), the flash
+attention K/V views of sequence s start s streams into the cache tensor,
+while the cache writes address it from row 0. The matcher required both
+pointers to be equal, so every slot but 0 fell back to the stock attention
+path and decoded different tokens. The kernel now takes a separate read
+base. 4 slots x 64k now match the single-slot server token for token in
+every slot; single-slot output and speed unchanged (8/8 identical, +0.0%).
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 3 ++-
+ ggml/src/ggml-cuda/p60-fa.cu    | 4 ++--
+ ggml/src/ggml-cuda/p60-mega.cuh | 2 ++
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fbb7dd65b..8ff3ac14f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4267,7 +4267,7 @@ static int p60_try_mega_attn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, i
+     memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
+     if (p60_view_root(Qf) != qrope || Kf->type != GGML_TYPE_F16 || Vf->type != GGML_TYPE_F16 || mask == nullptr || mask->type != GGML_TYPE_F16 ||
+             fa->src[4] != nullptr || max_bias != 0.0f || softcap != 0.0f ||
+-            Kf->data != ksr->data || Vf->data != vsr->data || p60_view_root(Kf) != p60_view_root(ksr) || p60_view_root(Vf) != p60_view_root(vsr) ||
++            Kf->data < ksr->data || Vf->data < vsr->data || p60_view_root(Kf) != p60_view_root(ksr) || p60_view_root(Vf) != p60_view_root(vsr) ||
+             Kf->ne[0] != 256 || Kf->ne[2] != 2 || Vf->ne[0] != 256 || Vf->ne[2] != 2 || Kf->ne[1] != Vf->ne[1] ||
+             Kf->nb[1] != ksr->nb[1] || Vf->nb[1] != vsr->nb[1] || Kf->nb[2] != 512 || Vf->nb[2] != 512 ||
+             mask->ne[0] < Kf->ne[1] || mask->ne[1] < T || mask->nb[0] != 2 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+@@ -4301,6 +4301,7 @@ static int p60_try_mega_attn(ggml_backend_cuda_context * ctx, ggml_cgraph * g, i
+     memcpy(&a.attn_factor, rp + 8, sizeof(float));
+     a.k_cache = (half *) ksr->data; a.k_row = ksr->nb[1] / 2; a.k_idx = (const int64_t *) ksr->src[1]->data;
+     a.v_cache = (half *) vsr->data; a.v_row = vsr->nb[1] / 2; a.v_idx = (const int64_t *) vsr->src[1]->data;
++    a.k_attn = (const half *) Kf->data; a.v_attn = (const half *) Vf->data;
+     a.n_kv = (int) Kf->ne[1];
+     a.mask = (const half *) mask->data; a.mask_row = mask->nb[1] / 2;
+     a.scale = scale;
+diff --git a/ggml/src/ggml-cuda/p60-fa.cu b/ggml/src/ggml-cuda/p60-fa.cu
+index b6c85f938..6608f2d80 100644
+--- a/ggml/src/ggml-cuda/p60-fa.cu
++++ b/ggml/src/ggml-cuda/p60-fa.cu
+@@ -743,8 +743,8 @@ void ggml_cuda_p60_mega_attn(ggml_backend_cuda_context & ctx, const ggml_cuda_p6
+ 
+     fa::Params fp = {};
+     fp.Q = q; fp.q_t = NQ * HD; fp.q_h = HD;
+-    fp.K = args.k_cache; fp.k_p = args.k_row; fp.k_h = HD;
+-    fp.V = args.v_cache; fp.v_p = args.v_row; fp.v_h = HD;
++    fp.K = args.k_attn; fp.k_p = args.k_row; fp.k_h = HD;
++    fp.V = args.v_attn; fp.v_p = args.v_row; fp.v_h = HD;
+     fp.mask = args.mask; fp.m_t = args.mask_row;
+     fp.L = args.n_kv; fp.chunk = chunk; fp.nsplit = nsplit; fp.scale = args.scale;
+     fp.part = part; fp.ml = ml.get();
+diff --git a/ggml/src/ggml-cuda/p60-mega.cuh b/ggml/src/ggml-cuda/p60-mega.cuh
+index b8a9cf18e..50586df7b 100644
+--- a/ggml/src/ggml-cuda/p60-mega.cuh
++++ b/ggml/src/ggml-cuda/p60-mega.cuh
+@@ -102,6 +102,8 @@ struct ggml_cuda_p60_mega_attn_args {
+     half *        v_cache;
+     int64_t       v_row;
+     const int64_t * v_idx;
++    const half *  k_attn;    // first row attended: the sequence's stream in a per-sequence cache, else k_cache
++    const half *  v_attn;
+     int           n_kv;      // positions attended (cache view length)
+     const half *  mask;      // [T rows of n_kv] f16
+     int64_t       mask_row;  // in halves
+-- 
+2.56.0
+

@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B on Tesla P100: llama.cpp patches
 
-35 patches for [llama.cpp](https://github.com/ggml-org/llama.cpp) that make the Qwen3.5/3.6 MoE models (tested on
+37 patches for [llama.cpp](https://github.com/ggml-org/llama.cpp) that make the Qwen3.5/3.6 MoE models (tested on
 **Qwen3.6-35B-A3B, Unsloth UD-Q4_K_XL**) run about **2x faster on Tesla P100 (GP100, sm_60)** cards, for both
 decoding and prompt processing.
 
@@ -104,7 +104,7 @@ All of it is opt-in through environment variables; without them the build behave
 | Variable | Effect |
 |---|---|
 | `GGML_CUDA_P60_MMVQ=1` | sm_60 fp16 matvec and the fusions below (patches 1-16). Required by everything else. |
-| `GGML_CUDA_P60_MEGA=1` | Persistent layer kernels, the MTP verify kernels and the prompt-processing kernels (patches 18-31). |
+| `GGML_CUDA_P60_MEGA=1` | Persistent layer kernels, the MTP verify kernels and the prompt-processing kernels (patches 18-31, 36-37). |
 | `LLAMA_MTP_DRAFT_VOCAB=draftvocab/dv32k.bin` | The MTP draft head scores 32k frequent tokens instead of all 248k (patch 17). |
 | `GGML_CUDA_P60_INVAR=1` | Single-token decode uses the MTP verify kernels: same output with and without MTP (patch 35). |
 | `GGML_CUDA_P60_EXACT=1` | Reference mode: decode and MTP verify bit-identical to stock llama.cpp (patch 32). Slow. |
@@ -147,7 +147,14 @@ the multi-token persistent kernels.
 **Prompt processing (patches 26-31).** An fp16 grouped GEMM for the MoE experts (q4_K / q5_K / q6_K dequantized to
 fp16 in shared memory, HFMA2 math, fp32 accumulation) instead of int8 MMQ, which sm_60 can only emulate: ~2.8x
 faster on these shapes. A gated delta net kernel for long batches (2x), and a flash-attention kernel for head
-size 256 with grouped-query attention (+26%).
+size 256 with grouped-query attention (+26%). Patch 36 adds a small-batch expert kernel for short prompts such as
+tool results, where each expert sees only a few tokens and the GEMM's 16-pair tile is mostly padding: it gives
+bit-identical results and cuts prompt time for a 64-token chunk by 11% and a 300-token chunk by 8%
+(`GGML_CUDA_P60_MOE_SMALL=0` turns it off).
+
+**Several slots (patch 37).** The persistent attention kernel only matched slot 0 of a per-slot KV cache, so every
+other slot fell back to the normal path and decoded different tokens. Now every slot gives the same output as a
+single-slot server. See [Several prompts kept warm](#several-prompts-kept-warm-multiple-slots).
 
 ## Scope and limits
 
@@ -171,6 +178,29 @@ $ scripts/run-server.sh ./llama.cpp-p100 /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.ggu
 
 `run-server.sh` is the configuration the numbers above were measured with (64k context, `-b 6144 -ub 1536`,
 MTP with 5 draft tokens and p-min 0.55).
+
+### Several prompts kept warm (multiple slots)
+
+An agent with a few fixed system prompts (main chat, voice, a couple of subagent types) can keep each of them
+cached on the GPUs, so switching between them never reprocesses a system prompt:
+
+```console
+$ SLOTS=4 scripts/run-server.sh ./llama.cpp-p100 /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --port 8080
+```
+
+This gives 4 slots with 64k of context each (`-c 256000 --parallel 4 --no-kv-unified --no-cache-idle-slots`) and
+uses about 15.7 / 15.3 GB on the two cards. Send `"id_slot": 0`-`3` with each request to pin a prompt type to a slot
+(ids wrap around; a request for a busy slot waits for it). Warming a slot is just a request with that system prompt
+and `max_tokens: 1`. With a 3-4k token system prompt cached, a follow-up request processed only its ~22 new tokens
+(~190 ms). Three slots decoding at once ran at ~60 t/s each.
+
+- **Use a per-slot cache (`--no-kv-unified`).** With one shared pool, a slot's tokens land at different cache
+  offsets, flash attention groups them into different tiles, and the output differs from a single-slot server.
+  With a cache per slot each one starts at offset 0, and every slot is token-identical to a single-slot server
+  (tested in every slot and with the prompts moved between slots).
+- **`--no-cache-idle-slots`** keeps the idle slots where they are. With a shared pool and that option left on, every
+  new request copies the idle slots to system RAM and clears them from the GPUs.
+- A single shared 262k pool does not fit at `-ub 1536` on 2x 16 GB; a shared 200k pool does.
 
 ## The draft vocabulary file
 
